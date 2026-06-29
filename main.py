@@ -132,7 +132,7 @@ def _check_intrabar_retest(engine, df, trader, now):
             _handle_event(event, trader, now)
 
 
-
+def _handle_event(event, trader, now):
     kind = event[0]
 
     if kind == "angle_check":
