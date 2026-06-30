@@ -78,6 +78,8 @@ def main():
             time.sleep(config.POLL_SECONDS)
             continue
 
+        df = signal_engine.compute_indicators(df, config.FAST_EMA_LEN, config.SLOW_EMA_LEN, config.ATR_LEN)
+
         latest_candle_time = df.index[-1]
         if latest_candle_time == last_seen_candle_time:
             # Same candle still open — but check wick retest mid-bar if armed
@@ -89,7 +91,6 @@ def main():
             continue
 
         last_seen_candle_time = latest_candle_time
-        df = signal_engine.compute_indicators(df, config.FAST_EMA_LEN, config.SLOW_EMA_LEN, config.ATR_LEN)
 
         events = engine.process(df, flat=trader.is_flat())
 
