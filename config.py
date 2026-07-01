@@ -27,7 +27,6 @@ POLL_SECONDS = 30              # How often to check for a new closed candle
 
 # ===== OPTIONS (free, via NSE's public option-chain endpoint) =====
 TARGET_PREMIUM = 95.0
-NSE_OPTION_SYMBOL = "NIFTY"
 LOT_SIZE = 75                  # IMPORTANT: verify current NSE Nifty lot size before going live
 
 # ===== PAPER TRADING =====

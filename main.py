@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import config
 import data_feed
 import signal_engine
-import option_chain
+import option_chain_synth
 import telegram_bot
 from paper_trader import PaperTrader
 
@@ -162,18 +162,24 @@ def _handle_event(event, trader, now):
 
 def _process_entry(direction, underlying_entry, underlying_sl, trader, now):
     dir_str = "CE (Buy)" if direction == 1 else "PE (Sell)"
+
     try:
-        chain = option_chain.fetch_option_chain(config.NSE_OPTION_SYMBOL)
-        strike_info = option_chain.find_strike_near_premium(chain, direction, config.TARGET_PREMIUM)
+        df = data_feed.get_recent_candles()
+        spot_price = float(df["close"].iloc[-1])
+        strike_info = option_chain_synth.find_strike_near_premium_synthetic(
+            spot_price, direction, config.TARGET_PREMIUM
+        )
     except Exception as e:
-        print(f"[{now}] Option chain fetch failed, skipping this signal: {e}")
-        telegram_bot.send_message(f"⚠️ Entry signal fired ({dir_str}) but option chain fetch failed: {e}")
+        print(f"[{now}] Synthetic option pricing failed: {e}")
+        telegram_bot.send_message(
+            f"⚠️ Entry signal fired ({dir_str}) but synthetic pricing failed: {e}"
+        )
         return
 
     msg = (
         f"📍 Entry signal: {dir_str}\n"
         f"Strike: {strike_info['strike']} {strike_info['option_type']}\n"
-        f"Premium: ₹{strike_info['premium']}\n"
+        f"Premium: ₹{strike_info['premium']} (B-S estimate, σ={strike_info['sigma_used']}%)\n"
         f"Expiry: {strike_info['expiry']}\n"
         f"(Paper trade - approve or it auto-executes in {config.APPROVAL_TIMEOUT_SECONDS}s)"
     )
