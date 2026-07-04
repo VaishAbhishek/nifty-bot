@@ -33,14 +33,6 @@ def is_force_close_time(now):
     return now.time() >= dtime(config.FORCE_CLOSE_HOUR, config.FORCE_CLOSE_MINUTE)
 
 
-def get_current_premium(chain_json, strike, option_type):
-    for row in chain_json["records"]["data"]:
-        side = row.get(option_type)
-        if side and row["strikePrice"] == strike:
-            return side.get("lastPrice")
-    return None
-
-
 def main():
     engine = signal_engine.SignalEngine(
         min_angle_deg=config.MIN_ANGLE_DEG,
@@ -200,13 +192,21 @@ def _process_entry(direction, underlying_entry, underlying_sl, trader, now):
 def _monitor_open_position(trader, now):
     pos = trader.position
     try:
-        chain = option_chain.fetch_option_chain(config.NSE_OPTION_SYMBOL)
-        current_premium = get_current_premium(chain, pos["strike"], pos["option_type"])
+        df = data_feed.get_recent_candles()
+        spot_price = float(df["close"].iloc[-1])
+        # Re-price the open position using current spot + B-S
+        current_premium = option_chain_synth.black_scholes(
+            S=spot_price,
+            K=pos["strike"],
+            T=option_chain_synth.get_time_to_expiry(
+                option_chain_synth.get_current_week_expiry_date()
+            ),
+            r=0.065,
+            sigma=option_chain_synth.get_india_vix(),
+            option_type=pos["option_type"]
+        )
     except Exception as e:
         print(f"[{now}] Could not fetch current premium: {e}")
-        return
-
-    if current_premium is None:
         return
 
     force_close = is_force_close_time(now)
