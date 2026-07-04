@@ -20,17 +20,20 @@ import config
 
 def get_india_vix():
     """
-    Fetch India VIX as volatility estimate.
-    Falls back to 15% if fetch fails.
+    Fetch India VIX as volatility base estimate.
+    Applies a 1.2x scalar because near-money Nifty option IV trades
+    at a premium to spot VIX — typically 15-20% higher.
+    Falls back to 16% if fetch fails.
     """
     try:
         vix = yf.Ticker("^INDIAVIX")
         hist = vix.history(period="1d", interval="5m")
         if not hist.empty:
-            return float(hist["Close"].iloc[-1]) / 100
+            raw_vix = float(hist["Close"].iloc[-1]) / 100
+            return raw_vix * 1.2  # IV premium over VIX
     except Exception:
         pass
-    return 0.15  # 15% fallback — conservative estimate for Nifty
+    return 0.16  # 16% fallback
 
 
 def black_scholes(S, K, T, r, sigma, option_type="CE"):
@@ -78,14 +81,17 @@ def get_time_to_expiry(expiry_date):
 
 def get_current_week_expiry_date():
     """
-    Nifty weekly options expire every Thursday.
-    Returns this week's Thursday date.
+    Nifty weekly options expire every TUESDAY effective September 1, 2025.
+    Returns this week's Tuesday date.
+    If today is Tuesday and market has closed (after 3:30 PM IST), return next Tuesday.
     """
+    import zoneinfo
     today = datetime.date.today()
-    days_to_thursday = (3 - today.weekday()) % 7  # 3 = Thursday
-    if days_to_thursday == 0 and datetime.datetime.now().hour >= 15:
-        days_to_thursday = 7  # Today is Thursday but market closed, use next week
-    return today + datetime.timedelta(days=days_to_thursday)
+    now_ist = datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Kolkata"))
+    days_to_tuesday = (1 - today.weekday()) % 7  # 1 = Tuesday
+    if days_to_tuesday == 0 and now_ist.hour >= 15 and now_ist.minute >= 30:
+        days_to_tuesday = 7  # Today is Tuesday but market closed, use next week
+    return today + datetime.timedelta(days=days_to_tuesday)
 
 
 def find_strike_near_premium_synthetic(spot_price, direction, target_premium=95.0, sigma=None):
