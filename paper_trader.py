@@ -43,10 +43,13 @@ class PaperTrader:
     def open_position(self, direction, strike_info, underlying_entry, underlying_sl, rr_ratio, now):
         entry_premium = strike_info["premium"]
         sl_distance_underlying = abs(underlying_entry - underlying_sl)
-        # Approximate premium SL/target distance using same point distance as underlying
-        # (a simplification - true option delta would scale this differently)
-        sl_premium = max(entry_premium - sl_distance_underlying, 0.5)
-        target_premium = entry_premium + rr_ratio * sl_distance_underlying
+
+        # Scale by approximate delta for near-ATM options
+        # ATM delta ~0.5 for CE and PE (absolute value)
+        # Using 0.45 as conservative estimate for slightly OTM ~₹95 premium strike
+        delta = 0.45
+        sl_premium = max(entry_premium - (sl_distance_underlying * delta), 0.5)
+        target_premium = entry_premium + (sl_distance_underlying * delta * rr_ratio)
 
         self.position = {
             "direction": direction,
