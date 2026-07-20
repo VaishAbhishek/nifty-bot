@@ -29,13 +29,32 @@ def compute_indicators(df, fast_len, slow_len, atr_len):
 
 
 def is_gap_bar(df, i):
+    """
+    Returns True if candle i is within the first 3 candles of a new day
+    AND the day opened with a gap (open != prior day's close).
+    This covers gap-driven crossovers that happen 1-2 candles after the open,
+    not just the exact gap candle itself.
+    """
     if i == 0:
         return False
     cur_day = df.index[i].date()
     prev_day = df.index[i - 1].date()
-    if cur_day != prev_day:
-        return df["open"].iloc[i] != df["close"].iloc[i - 1]
-    return False
+
+    # Find first candle of today
+    first_today_idx = i
+    while first_today_idx > 0 and df.index[first_today_idx - 1].date() == cur_day:
+        first_today_idx -= 1
+
+    # Check if today is a gap day
+    if first_today_idx == 0:
+        return False
+    today_open = df["open"].iloc[first_today_idx]
+    prev_close = df["close"].iloc[first_today_idx - 1]
+    is_gap_day = today_open != prev_close
+
+    # Skip first 3 candles (15 minutes) on a gap day
+    candles_into_day = i - first_today_idx
+    return is_gap_day and candles_into_day < 3
 
 
 class SignalEngine:

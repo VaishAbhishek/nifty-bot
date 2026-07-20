@@ -63,6 +63,17 @@ def main():
             time.sleep(60)
             continue
 
+        # Reset signal engine state at the start of each new trading day
+        current_day = now.date()
+        if not hasattr(main, '_last_trading_day') or main._last_trading_day != current_day:
+            engine.pending_dir = 0
+            engine.pending_cross_bar = None
+            engine.armed = False
+            engine.armed_dir = 0
+            engine.wait_start_bar = None
+            main._last_trading_day = current_day
+            print(f"[{now}] New trading day {current_day} — signal engine state reset")
+
         try:
             df = data_feed.get_recent_candles()
         except Exception as e:
