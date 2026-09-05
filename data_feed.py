@@ -14,8 +14,9 @@ def get_recent_candles(period="5d"):
     Returns a DataFrame of recent 5-min Nifty candles, indexed by IST datetime,
     with columns: open, high, low, close.
 
-    yfinance only allows up to ~60 days of 5m history - 5d is plenty for our
-    rolling EMA/ATR/angle calculations.
+    IMPORTANT: yfinance includes the current in-progress candle as the last row.
+    We filter it out to ensure only fully closed candles are processed — matching
+    how Pine Script handles calc_on_every_tick=false (bar close only).
     """
     df = yf.download(
         config.UNDERLYING_TICKER,
@@ -31,15 +32,22 @@ def get_recent_candles(period="5d"):
             "whether '^NSEI' is still the correct ticker."
         )
 
-    # yfinance sometimes returns MultiIndex columns when fetching a single ticker
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
     df = df.rename(columns=str.lower)[["open", "high", "low", "close"]]
 
-    # Convert to IST for session/force-close logic
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert("Asia/Kolkata")
+
+    # Drop the last candle if it's still in progress
+    # A 5-min candle opened at T is closed at T+5min
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    candle_close_times = df.index + pd.Timedelta(minutes=5)
+    df = df[candle_close_times <= now_ist]
+
+    if df.empty:
+        raise RuntimeError("No fully closed candles available yet.")
 
     return df

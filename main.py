@@ -66,11 +66,7 @@ def main():
         # Reset signal engine state at the start of each new trading day
         current_day = now.date()
         if not hasattr(main, '_last_trading_day') or main._last_trading_day != current_day:
-            engine.pending_dir = 0
-            engine.pending_cross_bar = None
-            engine.armed = False
-            engine.armed_dir = 0
-            engine.wait_start_bar = None
+            engine.reset_day()
             main._last_trading_day = current_day
             print(f"[{now}] New trading day {current_day} — signal engine state reset")
 
@@ -89,7 +85,7 @@ def main():
             if not trader.is_flat():
                 _monitor_open_position(trader, now)
             elif engine.armed and config.USE_WICK_FOR_RETEST:
-                _check_intrabar_retest(engine, df, trader, now)
+                _check_intrabar_retest(engine, trader, now)
             time.sleep(config.POLL_SECONDS)
             continue
 
@@ -106,34 +102,56 @@ def main():
         time.sleep(config.POLL_SECONDS)
 
 
-def _check_intrabar_retest(engine, df, trader, now):
+def _check_intrabar_retest(engine, trader, now):
     """
     When USE_WICK_FOR_RETEST=True, check if the live candle's running
     low (bullish) or high (bearish) has touched the Fast EMA mid-bar.
-    yfinance includes the current partial candle as the last row.
+
+    Note: data_feed.get_recent_candles() now filters out partial candles,
+    so we fetch raw data here to get the current in-progress candle's wick.
     """
-    fast_ema = df["fast_ema"].iloc[-1]
-    low = df["low"].iloc[-1]
-    high = df["high"].iloc[-1]
-    close = df["close"].iloc[-1]
-    slow_ema = df["slow_ema"].iloc[-1]
-    buffer = fast_ema * config.RETEST_BUFFER_PCT / 100
+    try:
+        import yfinance as yf
+        import pandas as pd
+        raw = yf.download(config.UNDERLYING_TICKER, period="1d",
+                          interval="5m", progress=False, auto_adjust=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        raw = raw.rename(columns=str.lower)
+        if raw.index.tz is None:
+            raw.index = raw.index.tz_localize("UTC")
+        raw.index = raw.index.tz_convert("Asia/Kolkata")
 
-    retest = False
-    if engine.armed_dir == 1 and low <= fast_ema + buffer:
-        retest = True
-    elif engine.armed_dir == -1 and high >= fast_ema - buffer:
-        retest = True
+        # Get closed candles for EMA calculation
+        df = data_feed.get_recent_candles()
+        df = signal_engine.compute_indicators(df, config.FAST_EMA_LEN,
+                                              config.SLOW_EMA_LEN, config.ATR_LEN)
 
-    if retest:
-        # Use current live price as entry (closer to real touch than candle close)
-        entry_price = float(close)
-        sl_price = float(slow_ema)
-        events = [("entry", engine.armed_dir, entry_price, sl_price)]
-        engine.armed = False
-        engine.armed_dir = 0
-        for event in events:
-            _handle_event(event, trader, now)
+        fast_ema = float(df["fast_ema"].iloc[-1])
+        slow_ema = float(df["slow_ema"].iloc[-1])
+
+        # Use LIVE partial candle's wick for retest detection
+        live_low  = float(raw["low"].iloc[-1])
+        live_high = float(raw["high"].iloc[-1])
+        live_close = float(raw["close"].iloc[-1])
+        buffer = fast_ema * config.RETEST_BUFFER_PCT / 100
+
+        retest = False
+        if engine.armed_dir == 1 and live_low <= fast_ema + buffer:
+            retest = True
+        elif engine.armed_dir == -1 and live_high >= fast_ema - buffer:
+            retest = True
+
+        if retest:
+            events = [("entry", engine.armed_dir, live_close, slow_ema)]
+            engine.armed = False
+            engine.armed_dir = 0
+            engine.wait_start_ts = None
+            for event in events:
+                _handle_event(event, trader, now)
+
+    except Exception as e:
+        print(f"[{now}] Intrabar retest check failed: {e}")
 
 
 def _handle_event(event, trader, now):
