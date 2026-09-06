@@ -22,9 +22,10 @@ class PaperTrader:
             with open(config.TRADE_LOG_PATH, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    "entry_time", "exit_time", "direction", "strike", "option_type",
-                    "entry_premium", "exit_premium", "sl_premium", "target_premium",
-                    "exit_reason", "pnl_per_lot", "result"
+                    "entry_time", "exit_time", "direction", "strike",
+                    "option_type", "instrument_key",
+                    "entry_premium", "exit_premium", "sl_premium",
+                    "target_premium", "exit_reason", "pnl_per_lot", "result"
                 ])
 
     def is_flat(self):
@@ -45,11 +46,21 @@ class PaperTrader:
         sl_distance_underlying = abs(underlying_entry - underlying_sl)
 
         # Scale by approximate delta for near-ATM options
-        # ATM delta ~0.5 for CE and PE (absolute value)
-        # Using 0.45 as conservative estimate for slightly OTM ~₹95 premium strike
         delta = 0.45
-        sl_premium = max(entry_premium - (sl_distance_underlying * delta), 0.5)
+        sl_premium     = max(entry_premium - (sl_distance_underlying * delta), 0.5)
         target_premium = entry_premium + (sl_distance_underlying * delta * rr_ratio)
+
+        self.position = {
+            "direction":      direction,
+            "strike":         strike_info["strike"],
+            "option_type":    strike_info["option_type"],
+            "entry_premium":  entry_premium,
+            "sl_premium":     sl_premium,
+            "target_premium": target_premium,
+            "entry_time":     now,
+            "instrument_key": strike_info.get("instrument_key", ""),  # Upstox key for live LTP
+        }
+        return self.position
 
         self.position = {
             "direction": direction,
@@ -101,7 +112,8 @@ class PaperTrader:
         with open(config.TRADE_LOG_PATH, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                pos["entry_time"], exit_time, pos["direction"], pos["strike"], pos["option_type"],
-                pos["entry_premium"], exit_premium, pos["sl_premium"], pos["target_premium"],
-                exit_reason, round(pnl_per_lot, 2), result
+                pos["entry_time"], exit_time, pos["direction"],
+                pos["strike"], pos["option_type"], pos.get("instrument_key", ""),
+                pos["entry_premium"], exit_premium, pos["sl_premium"],
+                pos["target_premium"], exit_reason, round(pnl_per_lot, 2), result
             ])

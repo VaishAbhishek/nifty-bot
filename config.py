@@ -20,14 +20,15 @@ RISK_REWARD_RATIO = 1.0        # test 1.0, then 2.0
 FORCE_CLOSE_HOUR = 15
 FORCE_CLOSE_MINUTE = 15
 
-# ===== UNDERLYING DATA (free, via yfinance) =====
-UNDERLYING_TICKER = "^NSEI"    # Nifty 50 index
-CANDLE_INTERVAL = "5m"
-POLL_SECONDS = 30              # How often to check for a new closed candle
+# ===== DATA SOURCE (Upstox API — Analytics Token) =====
+# Token is loaded from ~/.nifty_bot_env — never hardcode here
+UNDERLYING_TICKER = "NSE_INDEX|Nifty 50"   # Upstox instrument key
+CANDLE_INTERVAL   = "5m"
+POLL_SECONDS      = 30
 
-# ===== OPTIONS (free, via NSE's public option-chain endpoint) =====
+# ===== OPTIONS (Upstox real option chain) =====
 TARGET_PREMIUM = 95.0
-LOT_SIZE = 75                  # IMPORTANT: verify current NSE Nifty lot size before going live
+LOT_SIZE       = 75    # Verify current NSE Nifty lot size before going live
 
 # ===== PAPER TRADING =====
 PAPER_TRADING = True           # Keep True until you've validated results and are ready to risk real money
@@ -39,5 +40,5 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 APPROVAL_TIMEOUT_SECONDS = 60  # 1 minute, auto-executes if no response
 
 # ===== RISK CONTROL =====
-MAX_CONSECUTIVE_LOSSES = 99     # Pause new entries after this many losses in a row
+MAX_CONSECUTIVE_LOSSES = 2     # Pause new entries after this many losses in a row
                                 # Auto-resumes the next trading day
