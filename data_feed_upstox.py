@@ -1,11 +1,13 @@
 """
-Real-time Nifty 50 5-min candle data via Upstox API.
-Tries v3 first (newer format), falls back to v2.
+Real-time Nifty 50 candle data via Upstox API v2.
 
-Key fixes:
-- Uses last trading weekday as to_date (avoids Saturday/Sunday 404)
-- Handles intraday gracefully on weekends/holidays
-- Tries both API versions automatically
+Key finding from diagnostics:
+- v2 historical candle API supports 1minute and day intervals (NOT 5minute)
+- Solution: fetch 1-minute candles and resample to 5-minute using pandas
+- This produces mathematically identical OHLC to TradingView's 5-min bars
+
+Confirmed working endpoint:
+GET /v2/historical-candle/{instrumentKey}/1minute/{to_date}/{from_date}
 """
 
 import requests
@@ -15,60 +17,29 @@ from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 import config
 
-IST = ZoneInfo("Asia/Kolkata")
-
-# Upstox instrument key for Nifty 50 index
-INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
-ENCODED_KEY    = "NSE_INDEX%7CNifty%2050"
+IST          = ZoneInfo("Asia/Kolkata")
+BASE_URL     = "https://api.upstox.com/v2"
+ENCODED_KEY  = "NSE_INDEX%7CNifty%2050"   # NSE_INDEX|Nifty 50, URL-encoded
 
 
 def _headers():
     token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
     if not token:
-        raise RuntimeError(
-            "UPSTOX_ANALYTICS_TOKEN not set. Run: source ~/.nifty_bot_env"
-        )
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
+        raise RuntimeError("UPSTOX_ANALYTICS_TOKEN not set. Run: source ~/.nifty_bot_env")
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
-def _last_trading_day(from_date=None):
-    """
-    Returns the most recent weekday (Mon-Fri).
-    If from_date is None, starts from today.
-    Needed because Upstox rejects Saturday/Sunday as to_date.
-    """
-    d = from_date or date.today()
-    # weekday(): 0=Mon ... 4=Fri, 5=Sat, 6=Sun
-    while d.weekday() >= 5:
+def _last_trading_day():
+    """Returns the most recent weekday (skips Saturday/Sunday)."""
+    d = date.today()
+    while d.weekday() >= 5:   # 5=Sat, 6=Sun
         d -= timedelta(days=1)
     return d
 
 
-def _is_market_open():
-    """Returns True only during NSE trading hours on weekdays."""
-    from datetime import datetime, time as dtime
-    now = datetime.now(IST)
-    if now.weekday() >= 5:
-        return False
-    return dtime(9, 15) <= now.time() <= dtime(15, 30)
-
-
-def _parse_candles(response_json):
-    """
-    Upstox candle format: [timestamp, open, high, low, close, volume, oi]
-    Handles both v2 and v3 response structures.
-    """
-    # v2 structure: data.candles
-    # v3 structure: data.candles (same key, different nesting sometimes)
-    data = response_json.get("data", {})
-    if isinstance(data, dict):
-        candles = data.get("candles", [])
-    else:
-        candles = []
-
+def _parse_candles_1min(response_json):
+    """Parse Upstox 1-minute candle response into a clean DataFrame."""
+    candles = response_json.get("data", {}).get("candles", [])
     if not candles:
         return pd.DataFrame(columns=["open", "high", "low", "close"])
 
@@ -89,114 +60,98 @@ def _parse_candles(response_json):
     return df
 
 
-def _fetch_with_fallback(url_v3, url_v2):
-    """Try v3 first, fall back to v2 if it fails."""
-    for url in [url_v3, url_v2]:
-        try:
-            resp = requests.get(url, headers=_headers(), timeout=15)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception:
-            continue
-    # Both failed — raise the v2 error for diagnostics
-    resp = requests.get(url_v2, headers=_headers(), timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _get_historical(from_date_str, to_date_str):
-    """Fetch multi-day historical 5-min candles."""
-    url_v3 = (
-        f"https://api.upstox.com/v3/historical-candle"
-        f"/{ENCODED_KEY}/5minute/{to_date_str}/{from_date_str}"
-    )
-    url_v2 = (
-        f"https://api.upstox.com/v2/historical-candle"
-        f"/{ENCODED_KEY}/minute/5/{to_date_str}/{from_date_str}"
-    )
-    return _parse_candles(_fetch_with_fallback(url_v3, url_v2))
-
-
-def _get_intraday():
+def _resample_to_5min(df_1min):
     """
-    Fetch today's live 5-min candles.
-    Returns empty DataFrame gracefully on weekends or outside market hours.
-    """
-    if not _is_market_open():
-        return pd.DataFrame(columns=["open", "high", "low", "close"])
+    Resample 1-minute OHLC candles to 5-minute OHLC candles.
 
-    url_v3 = (
-        f"https://api.upstox.com/v3/historical-candle"
-        f"/intraday/{ENCODED_KEY}/5minute"
-    )
-    url_v2 = (
-        f"https://api.upstox.com/v2/historical-candle"
-        f"/intraday/{ENCODED_KEY}/minute/5"
-    )
-    try:
-        return _parse_candles(_fetch_with_fallback(url_v3, url_v2))
-    except Exception as e:
-        print(f"[Upstox] Intraday fetch skipped: {e}")
-        return pd.DataFrame(columns=["open", "high", "low", "close"])
+    NSE 5-min bar boundaries: 9:15, 9:20, 9:25 ... 3:25, 3:30
+    9:15 is divisible by 5 (555 min / 5 = 111) so no offset needed.
+
+    Resampling rule:
+      open  = first 1-min open in the 5-min window
+      high  = max of all 1-min highs
+      low   = min of all 1-min lows
+      close = last 1-min close
+    """
+    if df_1min.empty:
+        return df_1min
+
+    df_5min = df_1min.resample("5min").agg(
+        open=("open",   "first"),
+        high=("high",   "max"),
+        low= ("low",    "min"),
+        close=("close", "last"),
+    ).dropna()
+
+    # Keep only NSE market hours (9:15 AM – 3:30 PM)
+    df_5min = df_5min.between_time("09:15", "15:30")
+    return df_5min
 
 
 def get_recent_candles(lookback_days=7):
     """
-    Returns fully-closed 5-min Nifty candles for the last lookback_days
-    of trading days, merged with today's intraday data if market is open.
+    Returns fully-closed 5-min Nifty candles for the last lookback_days.
+    Fetches 1-minute data from Upstox and resamples to 5-minute.
     Partial (in-progress) candles are always filtered out.
     """
-    today          = date.today()
-    last_trade_day = _last_trading_day()                    # last weekday
-    from_date      = today - timedelta(days=lookback_days + 4)  # +4 buffer for weekends
+    last_trade  = _last_trading_day()
+    from_date   = (date.today() - timedelta(days=lookback_days + 4)).strftime("%Y-%m-%d")
+    to_date     = last_trade.strftime("%Y-%m-%d")
 
-    # Historical: from N days ago up to last trading weekday
+    # Single API call covers both historical and today's data
+    url = f"{BASE_URL}/historical-candle/{ENCODED_KEY}/1minute/{to_date}/{from_date}"
+
     try:
-        hist_df = _get_historical(
-            from_date.strftime("%Y-%m-%d"),
-            last_trade_day.strftime("%Y-%m-%d"),
-        )
+        resp = requests.get(url, headers=_headers(), timeout=20)
+        resp.raise_for_status()
     except Exception as e:
-        print(f"[Upstox] Historical fetch warning: {e}")
-        hist_df = pd.DataFrame(columns=["open", "high", "low", "close"])
+        raise RuntimeError(f"Upstox candle fetch failed: {e}\nURL: {url}")
 
-    # Intraday: today's live candles (empty if weekend/holiday)
-    intra_df = _get_intraday()
+    df_1min = _parse_candles_1min(resp.json())
+    if df_1min.empty:
+        raise RuntimeError("Upstox returned empty candle data — market might be closed.")
 
-    # Merge
-    parts = [df for df in [hist_df, intra_df] if not df.empty]
-    if not parts:
-        raise RuntimeError(
-            "No candle data from Upstox. "
-            "If market is open, check UPSTOX_ANALYTICS_TOKEN. "
-            "If weekend/holiday, this is expected — bot sleeps until Monday."
-        )
+    # If market is open today, fetch today's 1-min candles separately
+    # (historical endpoint may not include today's live data)
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    today_ist = date.today()
+    market_open  = pd.Timestamp(today_ist).tz_localize("Asia/Kolkata").replace(hour=9, minute=15)
+    market_close = pd.Timestamp(today_ist).tz_localize("Asia/Kolkata").replace(hour=15, minute=30)
+    is_weekday   = today_ist.weekday() < 5
 
-    df = pd.concat(parts)
-    df = df[~df.index.duplicated(keep="last")]
-    df = df.sort_index()
+    if is_weekday and market_open <= now_ist <= market_close:
+        today_str = today_ist.strftime("%Y-%m-%d")
+        url_today = f"{BASE_URL}/historical-candle/{ENCODED_KEY}/1minute/{today_str}/{today_str}"
+        try:
+            resp_today = requests.get(url_today, headers=_headers(), timeout=15)
+            if resp_today.status_code == 200:
+                df_today_1min = _parse_candles_1min(resp_today.json())
+                if not df_today_1min.empty:
+                    df_1min = pd.concat([df_1min, df_today_1min])
+                    df_1min = df_1min[~df_1min.index.duplicated(keep="last")]
+                    df_1min = df_1min.sort_index()
+        except Exception as e:
+            print(f"[Upstox] Today's intraday fetch skipped: {e}")
 
-    # Keep only last lookback_days worth
-    cutoff = pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(days=lookback_days + 4)
-    df = df[df.index >= cutoff]
+    # Resample 1-min → 5-min
+    df_5min = _resample_to_5min(df_1min)
+
+    if df_5min.empty:
+        raise RuntimeError("No 5-min candles after resampling — check market hours.")
 
     # Drop partial (in-progress) candles — candle at T closes at T+5min
-    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
-    df = df[df.index + pd.Timedelta(minutes=5) <= now_ist]
+    df_5min = df_5min[df_5min.index + pd.Timedelta(minutes=5) <= now_ist]
 
-    if df.empty:
-        raise RuntimeError(
-            "No fully closed candles available. "
-            "Market might not have opened yet today."
-        )
+    if df_5min.empty:
+        raise RuntimeError("No fully closed 5-min candles yet — too early in session?")
 
-    return df
+    return df_5min
 
 
 def get_ltp(instrument_key):
     """Fetch current Last Traded Price for any instrument key."""
     resp = requests.get(
-        "https://api.upstox.com/v2/market-quote/ltp",
+        f"{BASE_URL}/market-quote/ltp",
         params={"instrument_key": instrument_key},
         headers=_headers(),
         timeout=10,
