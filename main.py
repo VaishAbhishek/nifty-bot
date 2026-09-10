@@ -7,7 +7,9 @@ Now uses Upstox API for real NSE data:
 Run with: python3 main.py
 """
 
+import os
 import time
+import requests
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -69,6 +71,10 @@ def main():
             main._last_day = current_day
             print(f"[{now:%H:%M:%S}] New day {current_day} — engine state reset")
 
+        # ── Poll I1 OHLC — feeds today's live 1-min bars to accumulator ──
+        # Historical API only returns completed sessions; I1 fills today's gap.
+        _poll_i1_bar(now)
+
         # ── Fetch candles ──────────────────────────────────────────────
         try:
             df = data_feed.get_recent_candles()
@@ -107,7 +113,47 @@ def main():
         time.sleep(config.POLL_SECONDS)
 
 
-# ── Intrabar retest (wick touch mid-candle) ────────────────────────────────
+# ── I1 OHLC polling — builds today's live 1-min bars ─────────────────────────
+
+def _poll_i1_bar(now):
+    """
+    Fetch the current 1-minute OHLC bar from Upstox (interval=I1) and
+    store it in data_feed's intraday accumulator.
+
+    Called every 30 seconds. The bar_time key is floor(now, 1min) so
+    repeated polls within the same minute update the same entry — only
+    the final poll before the minute turns becomes the "completed" bar.
+    """
+    try:
+        token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
+        if not token:
+            return
+        resp = requests.get(
+            "https://api.upstox.com/v2/market-quote/ohlc",
+            params={"instrument_key": "NSE_INDEX|Nifty 50", "interval": "I1"},
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return
+        raw = resp.json().get("data", {}).get("NSE_INDEX:Nifty 50", {})
+        ohlc = raw.get("ohlc", {})
+        if not ohlc:
+            return
+
+        # Floor current time to the minute — this is the bar's timestamp
+        bar_time = now.replace(second=0, microsecond=0)
+        data_feed.update_intraday_bar(bar_time, {
+            "open":  ohlc["open"],
+            "high":  ohlc["high"],
+            "low":   ohlc["low"],
+            "close": ohlc["close"],
+        })
+    except Exception as e:
+        print(f"[{now:%H:%M:%S}] I1 poll failed: {e}")
+
+
+
 
 def _check_intrabar_retest(engine, df, trader, now):
     """
