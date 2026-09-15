@@ -1,14 +1,12 @@
 """
-Real-time Nifty 50 candle data via Upstox API v2.
+Nifty 50 5-min candle data via Upstox API.
 
-Key findings from diagnostics:
-- v2 historical candle API supports 1minute interval (confirmed working)
-- The historical API only returns COMPLETED sessions — today's live data is absent
-- Today's live data is fetched via market-quote/ohlc with interval=I1 (1-min bar)
-  and accumulated in memory by main.py polling every 30 seconds
+Two confirmed-working endpoints:
+  Intraday (today):  GET /v3/historical-candle/intraday/{key}/minutes/5
+  Historical (prev): GET /v2/historical-candle/{key}/1minute/{to}/{from}
+                     → resampled to 5-min
 
-Architecture:
-  Historical 1-min (API) + Today's 1-min (_intraday_bars dict) → resample to 5-min
+Both merged into one clean DataFrame for the signal engine.
 """
 
 import requests
@@ -16,65 +14,48 @@ import pandas as pd
 import os
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
-import config
 
 IST         = ZoneInfo("Asia/Kolkata")
-BASE_URL    = "https://api.upstox.com/v2"
-ENCODED_KEY = "NSE_INDEX%7CNifty%2050"   # URL-encoded NSE_INDEX|Nifty 50
+BASE_V2     = "https://api.upstox.com/v2"
+BASE_V3     = "https://api.upstox.com/v3"
+ENCODED_KEY = "NSE_INDEX%7CNifty%2050"    # URL-encoded NSE_INDEX|Nifty 50
 
-# ── Intraday accumulator ──────────────────────────────────────────────────────
-# main.py polls Upstox I1 OHLC every 30s and calls update_intraday_bar().
-# This builds today's 1-min bars in memory throughout the session.
-_intraday_bars = {}    # {pd.Timestamp (IST, tz-aware): {'open','high','low','close'}}
-_intraday_date = None  # date the bars belong to (resets on new session)
-
-
-def update_intraday_bar(bar_time, ohlc):
-    """
-    Store/update a 1-min bar from the live I1 OHLC feed.
-    bar_time: pd.Timestamp, minute-floored, IST timezone-aware
-    ohlc:     dict with keys open / high / low / close
-    """
-    global _intraday_bars, _intraday_date
-    today = bar_time.date()
-    if _intraday_date != today:
-        _intraday_bars = {}
-        _intraday_date = today
-    _intraday_bars[bar_time] = ohlc
-
-
-# ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _headers():
     token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
     if not token:
-        raise RuntimeError("UPSTOX_ANALYTICS_TOKEN not set. Run: source ~/.nifty_bot_env")
+        raise RuntimeError(
+            "UPSTOX_ANALYTICS_TOKEN not set. Run: source ~/.nifty_bot_env"
+        )
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
 def _last_trading_day():
-    """Most recent weekday — skips Saturday/Sunday."""
+    """Returns the most recent weekday — skips Saturday/Sunday."""
     d = date.today()
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
 
 
-def _parse_candles_1min(response_json):
-    """Parse Upstox candle response into a sorted IST-indexed DataFrame."""
+def _parse_candles(response_json, columns=None):
+    """
+    Parse Upstox candle list into a sorted IST-indexed DataFrame.
+    Each candle: [timestamp, open, high, low, close, volume, oi]
+    """
     candles = response_json.get("data", {}).get("candles", [])
     if not candles:
         return pd.DataFrame(columns=["open", "high", "low", "close"])
 
-    df = pd.DataFrame(
-        candles,
-        columns=["timestamp", "open", "high", "low", "close", "volume", "oi"]
-    )
+    cols = columns or ["timestamp", "open", "high", "low", "close", "volume", "oi"]
+    df = pd.DataFrame(candles, columns=cols)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+
     if df["timestamp"].dt.tz is None:
         df["timestamp"] = df["timestamp"].dt.tz_localize("Asia/Kolkata")
     else:
         df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
+
     df = df.set_index("timestamp")
     df = df[["open", "high", "low", "close"]].astype(float)
     return df.sort_index()
@@ -82,89 +63,107 @@ def _parse_candles_1min(response_json):
 
 def _resample_to_5min(df_1min):
     """
-    Resample 1-min OHLC to 5-min OHLC.
-    NSE bar boundaries (9:15, 9:20 … 3:25, 3:30) align naturally to 5-min grid.
+    Resample 1-min OHLC → 5-min OHLC.
+    NSE bar boundaries (9:15, 9:20 … 3:25, 3:30) align to 5-min grid naturally.
     """
     if df_1min.empty:
         return df_1min
     df_5min = df_1min.resample("5min").agg(
-        open=("open",   "first"),
-        high=("high",   "max"),
-        low= ("low",    "min"),
-        close=("close", "last"),
+        open=("open",  "first"),
+        high=("high",  "max"),
+        low= ("low",   "min"),
+        close=("close","last"),
     ).dropna()
     return df_5min.between_time("09:15", "15:30")
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def get_recent_candles(lookback_days=7):
+def _get_intraday_5min():
     """
-    Returns fully-closed 5-min Nifty candles covering the last lookback_days.
-
-    Merges two sources:
-      1. Historical 1-min candles from Upstox API (completed sessions only)
-      2. Today's live 1-min bars accumulated in _intraday_bars by main.py polling
-    Both are resampled to 5-min before returning.
-    Partial (in-progress) 5-min candles are always dropped.
+    Fetch today's live 5-min candles via v3 intraday endpoint.
+    Confirmed working: /v3/historical-candle/intraday/{key}/minutes/5
+    Returns empty DataFrame gracefully outside market hours.
     """
-    # ── Source 1: historical (completed sessions) ─────────────────────────────
+    url = f"{BASE_V3}/historical-candle/intraday/{ENCODED_KEY}/minutes/5"
+    try:
+        resp = requests.get(url, headers=_headers(), timeout=15)
+        if resp.status_code == 200:
+            return _parse_candles(resp.json())
+        # Outside market hours returns non-200 — that's fine, return empty
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
+    except Exception as e:
+        print(f"[Upstox] Intraday fetch skipped: {e}")
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
+
+
+def _get_historical_5min(lookback_days=7):
+    """
+    Fetch previous sessions' 1-min candles and resample to 5-min.
+    Confirmed working: /v2/historical-candle/{key}/1minute/{to}/{from}
+    """
     last_trade = _last_trading_day()
     from_date  = (date.today() - timedelta(days=lookback_days + 4)).strftime("%Y-%m-%d")
     to_date    = last_trade.strftime("%Y-%m-%d")
-    url = f"{BASE_URL}/historical-candle/{ENCODED_KEY}/1minute/{to_date}/{from_date}"
+    url = f"{BASE_V2}/historical-candle/{ENCODED_KEY}/1minute/{to_date}/{from_date}"
+
+    resp = requests.get(url, headers=_headers(), timeout=20)
+    resp.raise_for_status()
+    df_1min = _parse_candles(resp.json())
+
+    if df_1min.empty:
+        return df_1min
+    return _resample_to_5min(df_1min)
+
+
+def get_recent_candles(lookback_days=7):
+    """
+    Returns fully-closed 5-min Nifty candles covering the last lookback_days
+    plus today's live session.
+
+    Steps:
+      1. Fetch historical 5-min candles (prev days via 1-min API + resample)
+      2. Fetch today's live 5-min candles (v3 intraday endpoint, direct 5-min)
+      3. Merge, deduplicate, drop any partial in-progress candle
+    """
+    # Step 1: historical (previous completed sessions)
     try:
-        resp = requests.get(url, headers=_headers(), timeout=20)
-        resp.raise_for_status()
-        df_hist = _parse_candles_1min(resp.json())
+        df_hist = _get_historical_5min(lookback_days)
     except Exception as e:
-        raise RuntimeError(f"Upstox historical fetch failed: {e}\nURL: {url}")
+        raise RuntimeError(f"Upstox historical fetch failed: {e}")
 
-    # ── Source 2: today's live bars from intraday accumulator ─────────────────
-    if _intraday_bars:
-        rows = [
-            {"timestamp": ts,
-             "open":  v["open"], "high": v["high"],
-             "low":   v["low"],  "close": v["close"]}
-            for ts, v in _intraday_bars.items()
-        ]
-        df_intra = pd.DataFrame(rows).set_index("timestamp")
-        df_intra.index = pd.DatetimeIndex(df_intra.index)
-        if df_intra.index.tz is None:
-            df_intra.index = df_intra.index.tz_localize("Asia/Kolkata")
-        df_intra = df_intra[["open", "high", "low", "close"]].astype(float)
-        df_intra = df_intra.sort_index().between_time("09:15", "15:30")
-    else:
-        df_intra = pd.DataFrame(columns=["open", "high", "low", "close"])
+    # Step 2: today's live 5-min candles
+    df_intra = _get_intraday_5min()
 
-    # ── Merge → resample → filter ─────────────────────────────────────────────
+    # Step 3: merge
     parts = [df for df in [df_hist, df_intra] if not df.empty]
     if not parts:
-        raise RuntimeError("No candle data available from Upstox.")
+        raise RuntimeError(
+            "No candle data from Upstox. "
+            "Check UPSTOX_ANALYTICS_TOKEN and market hours."
+        )
 
-    df_1min = pd.concat(parts)
-    df_1min = df_1min[~df_1min.index.duplicated(keep="last")].sort_index()
+    df = pd.concat(parts)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
 
-    df_5min = _resample_to_5min(df_1min)
-    if df_5min.empty:
-        raise RuntimeError("No 5-min candles after resampling.")
+    # Keep only NSE market hours across all days
+    df = df.between_time("09:15", "15:30")
 
-    # Drop any partial (in-progress) 5-min candle
+    # Drop partial (in-progress) candle — bar at T is closed at T+5min
     now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
-    df_5min = df_5min[df_5min.index + pd.Timedelta(minutes=5) <= now_ist]
+    df = df[df.index + pd.Timedelta(minutes=5) <= now_ist]
 
-    if df_5min.empty:
+    if df.empty:
         raise RuntimeError(
             "No fully closed 5-min candles yet. "
-            "If market is open, I1 polling must be running in main.py."
+            "Market may not have opened, or today has no intraday data yet."
         )
-    return df_5min
+
+    return df
 
 
 def get_ltp(instrument_key):
     """Fetch current Last Traded Price for any Upstox instrument key."""
     resp = requests.get(
-        f"{BASE_URL}/market-quote/ltp",
+        f"{BASE_V2}/market-quote/ltp",
         params={"instrument_key": instrument_key},
         headers=_headers(),
         timeout=10,

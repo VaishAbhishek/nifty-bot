@@ -71,11 +71,10 @@ def main():
             main._last_day = current_day
             print(f"[{now:%H:%M:%S}] New day {current_day} — engine state reset")
 
-        # ── Poll I1 OHLC — feeds today's live 1-min bars to accumulator ──
-        # Historical API only returns completed sessions; I1 fills today's gap.
-        _poll_i1_bar(now)
-
         # ── Fetch candles ──────────────────────────────────────────────
+        # get_recent_candles() now merges:
+        #   - historical 5-min (v2 1-min API resampled)
+        #   - today's live 5-min (v3 intraday endpoint, no polling needed)
         try:
             df = data_feed.get_recent_candles()
         except Exception as e:
@@ -113,69 +112,28 @@ def main():
         time.sleep(config.POLL_SECONDS)
 
 
-# ── I1 OHLC polling — builds today's live 1-min bars ─────────────────────────
-
-def _poll_i1_bar(now):
-    """
-    Fetch the current 1-minute OHLC bar from Upstox (interval=I1) and
-    store it in data_feed's intraday accumulator.
-
-    Called every 30 seconds. The bar_time key is floor(now, 1min) so
-    repeated polls within the same minute update the same entry — only
-    the final poll before the minute turns becomes the "completed" bar.
-    """
-    try:
-        token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
-        if not token:
-            return
-        resp = requests.get(
-            "https://api.upstox.com/v2/market-quote/ohlc",
-            params={"instrument_key": "NSE_INDEX|Nifty 50", "interval": "I1"},
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            return
-        raw = resp.json().get("data", {}).get("NSE_INDEX:Nifty 50", {})
-        ohlc = raw.get("ohlc", {})
-        if not ohlc:
-            return
-
-        # Floor current time to the minute — this is the bar's timestamp
-        bar_time = now.replace(second=0, microsecond=0)
-        data_feed.update_intraday_bar(bar_time, {
-            "open":  ohlc["open"],
-            "high":  ohlc["high"],
-            "low":   ohlc["low"],
-            "close": ohlc["close"],
-        })
-    except Exception as e:
-        print(f"[{now:%H:%M:%S}] I1 poll failed: {e}")
-
-
-
 
 def _check_intrabar_retest(engine, df, trader, now):
     """
     Check if the live (partial) candle's wick has touched the Fast EMA.
-    We use the running low/high from the current intraday fetch.
+    Uses v3 intraday endpoint (minutes/5) — includes the current in-progress bar.
     """
     try:
-        # Fetch the FULL intraday data including partial last candle
-        import requests, os
         token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
         resp = requests.get(
-            "https://api.upstox.com/v2/historical-candle/intraday"
-            "/NSE_INDEX%7CNifty%2050/minute/5",
+            "https://api.upstox.com/v3/historical-candle/intraday"
+            "/NSE_INDEX%7CNifty%2050/minutes/5",
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
             timeout=10,
         )
+        if resp.status_code != 200:
+            return
         candles = resp.json().get("data", {}).get("candles", [])
         if not candles:
             return
 
-        # Last row is the in-progress candle
-        live = candles[-1]  # [ts, open, high, low, close, vol, oi]
+        # Last candle is the current in-progress bar
+        live = candles[-1]   # [ts, open, high, low, close, vol, oi]
         live_high  = float(live[2])
         live_low   = float(live[3])
         live_close = float(live[4])
@@ -191,15 +149,14 @@ def _check_intrabar_retest(engine, df, trader, now):
             retest = True
 
         if retest:
-            engine.armed        = False
-            engine.armed_dir    = 0
+            direction = engine.armed_dir
+            engine.armed         = False
+            engine.armed_dir     = 0
             engine.wait_start_ts = None
-            _handle_event(("entry", engine.armed_dir or
-                           (1 if live_close > fast_ema else -1),
-                           live_close, slow_ema), trader, now)
+            _handle_event(("entry", direction, live_close, slow_ema), trader, now)
 
     except Exception as e:
-        print(f"[{now:%H:%M:%S}] Intrabar retest check error: {e}")
+        print(f"[{now:%H:%M:%S}] Intrabar retest error: {e}")
 
 
 # ── Event handler ──────────────────────────────────────────────────────────
