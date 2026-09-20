@@ -1,456 +1,541 @@
 """
-Backtester for the Nifty EMA Crossover + Angle + Retest strategy.
-
-Reuses SignalEngine exactly as the live bot does, but walks through
-historical candles bar-by-bar instead of polling live data.
+Nifty 50 Options Strategy Backtester
+=====================================
+Systematically tests all combinations of key strategy parameters
+over 6 months of historical Nifty 5-min data fetched from Upstox.
 
 Usage:
-    source ~/.nifty_bot_env
-    python3 backtest.py                          # default: last 30 trading days
-    python3 backtest.py --days 60                # last 60 trading days
-    python3 backtest.py --from 2026-08-01 --to 2026-09-19
+  cd ~/nifty-bot
+  source ~/.nifty_bot_env
+  python3 backtest.py
 
-Output: backtest_trades.csv  (same columns as paper_trades.csv)
+Outputs:
+  backtest_all_results.csv   — every combination with full metrics
+  backtest_best_configs.csv  — top 20 configurations ranked by profit factor
+  Console summary of best config
+
+Runtime: ~5-10 minutes for all combinations on the VM.
 """
 
-import argparse
-import csv
 import os
 import sys
-from datetime import date, datetime, time as dtime, timedelta
+import time
+import itertools
+import warnings
+from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
 
-import config
-from signal_engine import SignalEngine, compute_indicators
-
+warnings.filterwarnings("ignore")
 IST = ZoneInfo("Asia/Kolkata")
-BASE_V2 = "https://api.upstox.com/v2"
-ENCODED_KEY = "NSE_INDEX%7CNifty%2050"
-MARKET_OPEN = dtime(9, 15)
-MARKET_CLOSE = dtime(15, 30)
-FORCE_CLOSE = dtime(config.FORCE_CLOSE_HOUR, config.FORCE_CLOSE_MINUTE)
 
-OUTPUT_CSV = "backtest_trades.csv"
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER GRID — edit here to add/remove values to test
+# ─────────────────────────────────────────────────────────────────────────────
+PARAM_GRID = {
+    "min_angle_deg":      [5, 7, 10, 15, 20],
+    "angle_confirm_bars": [1, 2, 3],
+    "risk_reward_ratio":  [1.0, 1.5, 2.0, 2.5, 3.0],
+    "max_wait_bars":      [8, 12, 15, 20],
+    "retest_buffer_pct":  [0.0, 0.05],    # % of fast EMA
+}
 
-# ── Upstox historical data ────────────────────────────────────────────────
+# Fixed parameters (not being optimised)
+FAST_LEN          = 9
+SLOW_LEN          = 15
+ATR_LEN           = 14
+USE_WICK          = True
+DELTA             = 0.45    # approximate ATM option delta for P&L scaling
+FORCE_CLOSE_HOUR  = 15
+FORCE_CLOSE_MIN   = 15
+MAX_CONSEC_LOSSES = 2       # pause after N consecutive losses (mirrors live bot)
 
+LOOKBACK_MONTHS   = 6       # how many months of history to fetch
+ENCODED_KEY       = "NSE_INDEX%7CNifty%2050"
+BASE_V2           = "https://api.upstox.com/v2"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA FETCHING
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _headers():
     token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
     if not token:
-        raise RuntimeError(
-            "UPSTOX_ANALYTICS_TOKEN not set. Run: source ~/.nifty_bot_env"
-        )
+        raise RuntimeError("UPSTOX_ANALYTICS_TOKEN not set. Run: source ~/.nifty_bot_env")
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
-def _fetch_1min_chunk(from_date: str, to_date: str) -> pd.DataFrame:
-    """Fetch 1-min candles for a date range from Upstox v2 historical API."""
-    url = f"{BASE_V2}/historical-candle/{ENCODED_KEY}/1minute/{to_date}/{from_date}"
-    resp = requests.get(url, headers=_headers(), timeout=30)
-    resp.raise_for_status()
-
-    candles = resp.json().get("data", {}).get("candles", [])
+def _parse_candles_1min(response_json):
+    candles = response_json.get("data", {}).get("candles", [])
     if not candles:
         return pd.DataFrame(columns=["open", "high", "low", "close"])
-
-    df = pd.DataFrame(
-        candles,
-        columns=["timestamp", "open", "high", "low", "close", "volume", "oi"],
-    )
+    df = pd.DataFrame(candles,
+                      columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     if df["timestamp"].dt.tz is None:
         df["timestamp"] = df["timestamp"].dt.tz_localize("Asia/Kolkata")
     else:
         df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata")
-
     df = df.set_index("timestamp")
     return df[["open", "high", "low", "close"]].astype(float).sort_index()
 
 
-def fetch_historical_5min(from_date: date, to_date: date) -> pd.DataFrame:
-    """
-    Fetch historical 1-min data in chunks (Upstox limits per-request range)
-    and resample to 5-min candles.
-
-    Upstox v2 historical API may limit to ~30 days per call, so we chunk
-    into 25-day windows to be safe.
-    """
-    all_chunks = []
-    chunk_start = from_date
-    chunk_size = timedelta(days=25)
-
-    print(f"Fetching historical data: {from_date} → {to_date}")
-    while chunk_start <= to_date:
-        chunk_end = min(chunk_start + chunk_size, to_date)
-        print(f"  Chunk: {chunk_start} → {chunk_end} ...", end=" ", flush=True)
-
-        try:
-            df = _fetch_1min_chunk(
-                chunk_start.strftime("%Y-%m-%d"),
-                chunk_end.strftime("%Y-%m-%d"),
-            )
-            if not df.empty:
-                all_chunks.append(df)
-                print(f"{len(df)} bars")
-            else:
-                print("empty")
-        except Exception as e:
-            print(f"error: {e}")
-
-        chunk_start = chunk_end + timedelta(days=1)
-
-    if not all_chunks:
-        raise RuntimeError("No historical data fetched from Upstox.")
-
-    df_1min = pd.concat(all_chunks).sort_index()
-    df_1min = df_1min[~df_1min.index.duplicated(keep="last")]
-
-    # Resample to 5-min
+def _resample_to_5min(df_1min):
+    if df_1min.empty:
+        return df_1min
     df_5min = df_1min.resample("5min").agg(
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
+        open=("open",  "first"),
+        high=("high",  "max"),
+        low= ("low",   "min"),
+        close=("close","last"),
     ).dropna()
+    return df_5min.between_time("09:15", "15:30")
 
-    df_5min = df_5min.between_time("09:15", "15:30")
-    print(f"Total 5-min candles: {len(df_5min)}")
+
+def _last_trading_day():
+    d = date.today()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def fetch_historical_data(months=6):
+    """
+    Fetch N months of 1-min Nifty candles from Upstox and resample to 5-min.
+    Upstox v2 historical-candle endpoint returns max ~180 days of 1-min data.
+    We fetch in monthly chunks to stay within API limits.
+    """
+    print(f"Fetching {months} months of 5-min Nifty history from Upstox...")
+    last_trade = _last_trading_day()
+    all_frames = []
+
+    chunk_end = last_trade
+    for chunk in range(months):
+        chunk_start = chunk_end - timedelta(days=32)  # ~1 month
+        url = (f"{BASE_V2}/historical-candle/{ENCODED_KEY}/1minute"
+               f"/{chunk_end.strftime('%Y-%m-%d')}/{chunk_start.strftime('%Y-%m-%d')}")
+        try:
+            resp = requests.get(url, headers=_headers(), timeout=30)
+            if resp.status_code == 200:
+                df_chunk = _parse_candles_1min(resp.json())
+                if not df_chunk.empty:
+                    all_frames.append(df_chunk)
+                    print(f"  Chunk {chunk+1}/{months}: {len(df_chunk)} 1-min bars "
+                          f"({chunk_start} → {chunk_end})")
+            else:
+                print(f"  Chunk {chunk+1}/{months}: HTTP {resp.status_code} — skipped")
+        except Exception as e:
+            print(f"  Chunk {chunk+1}/{months}: Error — {e}")
+        chunk_end = chunk_start - timedelta(days=1)
+        while chunk_end.weekday() >= 5:
+            chunk_end -= timedelta(days=1)
+        time.sleep(0.5)  # gentle rate limiting
+
+    if not all_frames:
+        raise RuntimeError("No historical data fetched. Check token and connectivity.")
+
+    df_1min = pd.concat(all_frames)
+    df_1min = df_1min[~df_1min.index.duplicated(keep="last")].sort_index()
+    df_5min = _resample_to_5min(df_1min)
+    print(f"\n✅ Total 5-min candles: {len(df_5min)} "
+          f"({df_5min.index[0].date()} to {df_5min.index[-1].date()})\n")
     return df_5min
 
 
-# ── Backtest engine ────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# INDICATORS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_indicators(df, fast_len=9, slow_len=15, atr_len=14):
+    df = df.copy()
+    df["fast_ema"] = df["close"].ewm(span=fast_len, adjust=False).mean()
+    df["slow_ema"] = df["close"].ewm(span=slow_len, adjust=False).mean()
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"]  - df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1 / atr_len, adjust=False).mean()
+    return df
 
 
-class BacktestPosition:
-    """Tracks a single simulated position during the backtest."""
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE BACKTEST RUN
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def __init__(self, direction, entry_bar_ts, entry_close, fast_ema, slow_ema):
-        self.direction = direction
-        self.entry_time = entry_bar_ts
-
-        # Entry at Fast EMA (retest price)
-        self.entry_price = fast_ema
-
-        # SL just beyond Slow EMA
-        if direction == 1:  # CE (bullish)
-            self.sl_price = slow_ema
-        else:  # PE (bearish)
-            self.sl_price = slow_ema
-
-        # Convert underlying levels to option premium terms
-        sl_distance = abs(self.entry_price - self.sl_price)
-        delta = 0.45  # approximate near-ATM delta
-
-        self.entry_premium = config.TARGET_PREMIUM  # ~₹95
-        self.sl_premium = max(self.entry_premium - (sl_distance * delta), 0.5)
-        self.target_premium = self.entry_premium + (
-            sl_distance * delta * config.RISK_REWARD_RATIO
-        )
-
-        self.option_type = "CE" if direction == 1 else "PE"
-        # Approximate strike (round to nearest 50)
-        self.strike = int(round(entry_close / 50) * 50)
+def is_gap_bar(df, i):
+    if i == 0:
+        return False
+    if df.index[i].date() != df.index[i - 1].date():
+        return df["open"].iloc[i] != df["close"].iloc[i - 1]
+    return False
 
 
-def run_backtest(df_5min: pd.DataFrame) -> list[dict]:
-    """
-    Walk through candles bar-by-bar, running the SignalEngine on each,
-    and simulate trades matching the live bot's logic.
-    """
-    engine = SignalEngine(
-        min_angle_deg=config.MIN_ANGLE_DEG,
-        angle_confirm_bars=config.ANGLE_CONFIRM_BARS,
-        retest_buffer_pct=config.RETEST_BUFFER_PCT,
-        use_wick_for_retest=config.USE_WICK_FOR_RETEST,
-        max_wait_bars=config.MAX_WAIT_BARS,
+def is_force_close(ts):
+    return ts.hour > FORCE_CLOSE_HOUR or (
+        ts.hour == FORCE_CLOSE_HOUR and ts.minute >= FORCE_CLOSE_MIN
     )
 
+
+def run_backtest(df, params):
+    """
+    Run a full backtest on df using the given parameter dict.
+    Returns a dict of performance metrics.
+    Mirrors the live bot's logic exactly (same state machine).
+    """
+    min_angle   = params["min_angle_deg"]
+    conf_bars   = params["angle_confirm_bars"]
+    rr          = params["risk_reward_ratio"]
+    max_wait    = params["max_wait_bars"]
+    buf_pct     = params["retest_buffer_pct"]
+
+    fast = df["fast_ema"]
+    slow = df["slow_ema"]
+    atr  = df["atr"]
+
+    # State
+    pending_dir      = 0
+    pending_cross_i  = None
+    armed            = False
+    armed_dir        = 0
+    wait_start_i     = None
+
+    # Position
+    in_trade      = False
+    trade_dir     = 0
+    entry_price   = 0.0
+    sl_price      = 0.0
+    target_price  = 0.0
+
+    # Results
     trades = []
-    position = None  # BacktestPosition or None
-    consecutive_losses = 0
-    paused_date = None
-    last_day = None
+    consec_losses = 0
+    paused_date   = None
+    last_day      = None
 
-    for bar_idx in range(1, len(df_5min)):
-        # Work with the slice [0..bar_idx] — only bars up to "now"
-        df_slice = df_5min.iloc[: bar_idx + 1].copy()
-        ts = df_slice.index[-1]
-        current_day = ts.date()
-        current_time = ts.time()
+    n = len(df)
 
-        # ── Daily reset ───────────────────────────────────────────────
-        if last_day is not None and current_day != last_day:
-            engine.reset_day()
-            if paused_date is not None and current_day > paused_date:
-                paused_date = None
-                consecutive_losses = 0
-        last_day = current_day
+    for i in range(max(conf_bars + 2, 25), n):
+        ts    = df.index[i]
+        day   = ts.date()
 
-        # ── Skip if paused ────────────────────────────────────────────
-        if paused_date is not None:
+        # Daily reset
+        if day != last_day:
+            pending_dir     = 0
+            pending_cross_i = None
+            armed           = False
+            armed_dir       = 0
+            wait_start_i    = None
+            last_day        = day
+            # Reset consecutive-loss pause on new day
+            if paused_date is not None and day > paused_date:
+                paused_date   = None
+                consec_losses = 0
+
+        # Skip if paused
+        if paused_date is not None and day <= paused_date:
             continue
 
-        # ── Compute indicators on the slice ───────────────────────────
-        df_slice = compute_indicators(
-            df_slice, config.FAST_EMA_LEN, config.SLOW_EMA_LEN, config.ATR_LEN
-        )
+        # ── If in trade: check SL / target / force close ──────────────
+        if in_trade:
+            hi = df["high"].iloc[i]
+            lo = df["low"].iloc[i]
+            closed = False
+            result = None
 
-        is_flat = position is None
+            force = is_force_close(ts)
+            if force:
+                exit_px = df["close"].iloc[i]
+                result  = "EOD"
+                closed  = True
+            elif trade_dir == 1:   # long (CE)
+                if lo <= sl_price:
+                    exit_px = sl_price; result = "SL"; closed = True
+                elif hi >= target_price:
+                    exit_px = target_price; result = "Target"; closed = True
+            else:                  # short (PE)
+                if hi >= sl_price:
+                    exit_px = sl_price; result = "SL"; closed = True
+                elif lo <= target_price:
+                    exit_px = target_price; result = "Target"; closed = True
 
-        # ── Force close at 3:15 PM ────────────────────────────────────
-        if position is not None and current_time >= FORCE_CLOSE:
-            exit_premium = position.entry_premium  # approximate: exit at entry (flat)
-            pnl_per_lot = 0.0
-            result = "LOSS"
-            trades.append(_make_trade_row(position, ts, exit_premium, "EOD", pnl_per_lot, result))
-            if result == "LOSS":
-                consecutive_losses += 1
-                if consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
-                    paused_date = current_day
-            position = None
-            continue
-
-        # ── Monitor open position (SL/target on underlying) ───────────
-        if position is not None:
-            close_now = float(df_slice["close"].iloc[-1])
-            high_now = float(df_slice["high"].iloc[-1])
-            low_now = float(df_slice["low"].iloc[-1])
-            fast_ema_now = float(df_slice["fast_ema"].iloc[-1])
-            slow_ema_now = float(df_slice["slow_ema"].iloc[-1])
-
-            exit_reason = None
-            if position.direction == 1:  # CE
-                # SL: price drops below slow EMA → option premium collapses
-                if low_now <= position.sl_price:
-                    exit_reason = "SL"
-                # Target: price rises enough → option premium hits target
-                elif high_now >= position.entry_price + (
-                    abs(position.entry_price - position.sl_price) * config.RISK_REWARD_RATIO
-                ):
-                    exit_reason = "Target"
-            else:  # PE
-                # SL: price rises above slow EMA
-                if high_now >= position.sl_price:
-                    exit_reason = "SL"
-                # Target: price drops enough
-                elif low_now <= position.entry_price - (
-                    abs(position.entry_price - position.sl_price) * config.RISK_REWARD_RATIO
-                ):
-                    exit_reason = "Target"
-
-            if exit_reason:
-                sl_dist = abs(position.entry_price - position.sl_price)
-                delta = 0.45
-
-                if exit_reason == "SL":
-                    exit_premium = position.sl_premium
-                elif exit_reason == "Target":
-                    exit_premium = position.target_premium
+            if closed:
+                # P&L on underlying (DELTA-scaled to approximate option premium move)
+                raw_pnl = (exit_px - entry_price) * trade_dir
+                opt_pnl = raw_pnl * DELTA
+                trades.append({
+                    "entry_time":  df.index[i - 1],   # approximate — retest bar
+                    "exit_time":   ts,
+                    "direction":   trade_dir,
+                    "entry_price": entry_price,
+                    "exit_price":  exit_px,
+                    "sl_price":    sl_price,
+                    "target_price":target_price,
+                    "exit_reason": result,
+                    "underlying_pnl": round(raw_pnl, 2),
+                    "option_pnl_est": round(opt_pnl, 2),
+                    "win":         1 if opt_pnl > 0 else 0,
+                })
+                in_trade = False
+                if opt_pnl <= 0:
+                    consec_losses += 1
+                    if consec_losses >= MAX_CONSEC_LOSSES:
+                        paused_date = day
                 else:
-                    exit_premium = position.entry_premium
+                    consec_losses = 0
+            continue  # don't look for new signals while in trade
 
-                pnl_per_lot = (exit_premium - position.entry_premium) * config.LOT_SIZE
-                result = "WIN" if pnl_per_lot > 0 else "LOSS"
-                trades.append(_make_trade_row(position, ts, exit_premium, exit_reason, pnl_per_lot, result))
+        # ── Signal engine ──────────────────────────────────────────────
 
-                if result == "LOSS":
-                    consecutive_losses += 1
-                    if consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
-                        paused_date = current_day
-                else:
-                    consecutive_losses = 0
-                position = None
+        # Step 1: crossover
+        cross_up   = fast.iloc[i-1] < slow.iloc[i-1] and fast.iloc[i] > slow.iloc[i]
+        cross_down = fast.iloc[i-1] > slow.iloc[i-1] and fast.iloc[i] < slow.iloc[i]
+        gap        = is_gap_bar(df, i)
 
-        # ── Run signal engine ─────────────────────────────────────────
-        events = engine.process(df_slice, flat=(position is None))
+        if (cross_up or cross_down) and not gap and not armed and pending_dir == 0:
+            pending_dir     = 1 if cross_up else -1
+            pending_cross_i = i
 
-        for event in events:
-            kind = event[0]
+        # Step 2: angle confirmation
+        if pending_dir != 0 and pending_cross_i is not None:
+            bars_since = i - pending_cross_i
+            if bars_since == conf_bars:
+                denom = float(atr.iloc[i])
+                if denom != 0:
+                    slope    = (float(fast.iloc[i]) - float(fast.iloc[pending_cross_i])) / conf_bars
+                    angle    = float(np.degrees(np.arctan(slope / denom)))
+                    passed   = (angle >= min_angle if pending_dir == 1
+                                else angle <= -min_angle)
+                    if passed:
+                        armed        = True
+                        armed_dir    = pending_dir
+                        wait_start_i = i
+                pending_dir     = 0
+                pending_cross_i = None
+            elif bars_since > conf_bars:
+                pending_dir     = 0
+                pending_cross_i = None
 
-            if kind == "angle_check":
-                _, direction, angle_deg, passed = event
-                dir_str = "Bullish" if direction == 1 else "Bearish"
-                status = "PASSED ✅" if passed else "rejected"
-                print(f"  [{ts:%Y-%m-%d %H:%M}] {dir_str} angle={angle_deg:.1f}° {status}")
+        # Step 3: invalidation
+        if armed and wait_start_i is not None:
+            bars_waited  = i - wait_start_i
+            timed_out    = bars_waited > max_wait
+            trend_broken = (df["close"].iloc[i] < slow.iloc[i] if armed_dir == 1
+                            else df["close"].iloc[i] > slow.iloc[i])
+            if timed_out or trend_broken or is_force_close(ts):
+                armed        = False
+                armed_dir    = 0
+                wait_start_i = None
 
-            elif kind == "armed":
-                _, direction = event
-                dir_str = "CE" if direction == 1 else "PE"
-                print(f"  [{ts:%Y-%m-%d %H:%M}] Armed: {dir_str}")
+        # Step 4: retest → entry
+        if armed and not is_force_close(ts):
+            fa  = float(fast.iloc[i])
+            buf = fa * buf_pct / 100
+            if armed_dir == 1:
+                retest = df["low"].iloc[i] <= fa + buf
+            else:
+                retest = df["high"].iloc[i] >= fa - buf
 
-            elif kind == "invalidated":
-                _, reason = event
-                print(f"  [{ts:%Y-%m-%d %H:%M}] Invalidated: {reason}")
+            if retest:
+                ep       = float(df["close"].iloc[i])
+                sl       = float(slow.iloc[i])
+                sl_dist  = abs(ep - sl)
+                if sl_dist < 1.0:
+                    sl_dist = 1.0
+                tp = ep + armed_dir * rr * sl_dist
 
-            elif kind == "entry" and position is None:
-                _, direction, entry_close, slow_ema_val = event
-                fast_ema_val = float(df_slice["fast_ema"].iloc[-1])
-
-                position = BacktestPosition(
-                    direction=direction,
-                    entry_bar_ts=ts,
-                    entry_close=entry_close,
-                    fast_ema=fast_ema_val,
-                    slow_ema=slow_ema_val,
-                )
-                dir_str = "CE" if direction == 1 else "PE"
-                print(
-                    f"  [{ts:%Y-%m-%d %H:%M}] ENTRY {dir_str} @ fast_ema={fast_ema_val:.2f} "
-                    f"SL={slow_ema_val:.2f} "
-                    f"premium: ₹{position.entry_premium:.2f} "
-                    f"SL_prem: ₹{position.sl_premium:.2f} "
-                    f"TGT_prem: ₹{position.target_premium:.2f}"
-                )
-
-    # ── Force close any open position at end of data ──────────────────
-    if position is not None:
-        ts = df_5min.index[-1]
-        trades.append(_make_trade_row(position, ts, position.entry_premium, "EOD", 0.0, "LOSS"))
+                in_trade     = True
+                trade_dir    = armed_dir
+                entry_price  = ep
+                sl_price     = sl
+                target_price = tp
+                armed        = False
+                armed_dir    = 0
+                wait_start_i = None
 
     return trades
 
 
-def _make_trade_row(pos, exit_ts, exit_premium, exit_reason, pnl_per_lot, result):
+# ─────────────────────────────────────────────────────────────────────────────
+# METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_metrics(trades, params):
+    if not trades:
+        return None
+
+    df_t = pd.DataFrame(trades)
+    total  = len(df_t)
+    wins   = int(df_t["win"].sum())
+    losses = total - wins
+
+    if total < 3:   # skip configs with too few trades — not statistically meaningful
+        return None
+
+    win_rate    = wins / total * 100
+    avg_win     = df_t.loc[df_t["win"] == 1, "option_pnl_est"].mean() if wins   > 0 else 0
+    avg_loss    = df_t.loc[df_t["win"] == 0, "option_pnl_est"].mean() if losses > 0 else 0
+    total_pnl   = df_t["option_pnl_est"].sum()
+    gross_win   = df_t.loc[df_t["win"] == 1, "option_pnl_est"].sum()
+    gross_loss  = abs(df_t.loc[df_t["win"] == 0, "option_pnl_est"].sum())
+    profit_factor = round(gross_win / gross_loss, 3) if gross_loss > 0 else float("inf")
+
+    # Max drawdown (on cumulative P&L curve)
+    cum_pnl = df_t["option_pnl_est"].cumsum()
+    roll_max = cum_pnl.cummax()
+    drawdown = (cum_pnl - roll_max)
+    max_dd   = round(drawdown.min(), 2)
+
+    # Expectancy per trade
+    expectancy = round(total_pnl / total, 2)
+
+    by_reason  = df_t["exit_reason"].value_counts().to_dict()
+
     return {
-        "entry_time": pos.entry_time,
-        "exit_time": exit_ts,
-        "direction": pos.direction,
-        "strike": pos.strike,
-        "option_type": pos.option_type,
-        "instrument_key": "",
-        "entry_premium": round(pos.entry_premium, 2),
-        "exit_premium": round(exit_premium, 2),
-        "sl_premium": round(pos.sl_premium, 2),
-        "target_premium": round(pos.target_premium, 2),
-        "exit_reason": exit_reason,
-        "pnl_per_lot": round(pnl_per_lot, 2),
-        "result": result,
+        # Parameters
+        **params,
+        # Trade counts
+        "total_trades":   total,
+        "wins":           wins,
+        "losses":         losses,
+        "win_rate_pct":   round(win_rate, 1),
+        # P&L (delta-scaled option estimate, per-lot)
+        "total_pnl":      round(total_pnl, 2),
+        "avg_win":        round(avg_win, 2),
+        "avg_loss":       round(avg_loss, 2),
+        "expectancy":     expectancy,
+        "profit_factor":  profit_factor,
+        "max_drawdown":   max_dd,
+        # Exit breakdown
+        "sl_exits":       by_reason.get("SL", 0),
+        "target_exits":   by_reason.get("Target", 0),
+        "eod_exits":      by_reason.get("EOD", 0),
     }
 
 
-def write_csv(trades: list[dict], output_path: str):
-    """Write trades to CSV matching paper_trades.csv format."""
-    if not trades:
-        print("No trades to write.")
-        return
-
-    fieldnames = [
-        "entry_time", "exit_time", "direction", "strike",
-        "option_type", "instrument_key",
-        "entry_premium", "exit_premium", "sl_premium",
-        "target_premium", "exit_reason", "pnl_per_lot", "result",
-    ]
-    with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(trades)
-
-    print(f"\n✅ {len(trades)} trades written to {output_path}")
-
-
-def print_summary(trades: list[dict]):
-    """Print a quick summary of backtest results."""
-    if not trades:
-        print("\nNo trades generated during backtest period.")
-        return
-
-    wins = [t for t in trades if t["result"] == "WIN"]
-    losses = [t for t in trades if t["result"] == "LOSS"]
-    total_pnl = sum(t["pnl_per_lot"] for t in trades)
-
-    print("\n" + "=" * 60)
-    print("BACKTEST SUMMARY")
-    print("=" * 60)
-    print(f"  Total trades : {len(trades)}")
-    print(f"  Wins         : {len(wins)}")
-    print(f"  Losses       : {len(losses)}")
-    print(f"  Win rate     : {len(wins)/len(trades)*100:.1f}%")
-    print(f"  Total P&L    : ₹{total_pnl:,.2f} (per lot)")
-    print(f"  Avg P&L/trade: ₹{total_pnl/len(trades):,.2f}")
-
-    if wins:
-        avg_win = sum(t["pnl_per_lot"] for t in wins) / len(wins)
-        print(f"  Avg Win      : ₹{avg_win:,.2f}")
-    if losses:
-        avg_loss = sum(t["pnl_per_lot"] for t in losses) / len(losses)
-        print(f"  Avg Loss     : ₹{avg_loss:,.2f}")
-
-    # Breakdown by exit reason
-    reasons = {}
-    for t in trades:
-        r = t["exit_reason"]
-        reasons[r] = reasons.get(r, 0) + 1
-    print(f"\n  Exit reasons:")
-    for reason, count in sorted(reasons.items()):
-        print(f"    {reason}: {count}")
-
-    # Breakdown by direction
-    ce_trades = [t for t in trades if t["direction"] == 1]
-    pe_trades = [t for t in trades if t["direction"] == -1]
-    if ce_trades:
-        ce_pnl = sum(t["pnl_per_lot"] for t in ce_trades)
-        ce_wins = len([t for t in ce_trades if t["result"] == "WIN"])
-        print(f"\n  CE trades: {len(ce_trades)} ({ce_wins}W) → ₹{ce_pnl:,.2f}")
-    if pe_trades:
-        pe_pnl = sum(t["pnl_per_lot"] for t in pe_trades)
-        pe_wins = len([t for t in pe_trades if t["result"] == "WIN"])
-        print(f"  PE trades: {len(pe_trades)} ({pe_wins}W) → ₹{pe_pnl:,.2f}")
-
-    print("=" * 60)
-
-
-# ── CLI ────────────────────────────────────────────────────────────────────
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Backtest Nifty EMA strategy")
-    parser.add_argument("--days", type=int, default=30, help="Number of calendar days to backtest (default 30)")
-    parser.add_argument("--from", dest="from_date", type=str, help="Start date YYYY-MM-DD")
-    parser.add_argument("--to", dest="to_date", type=str, help="End date YYYY-MM-DD (default today)")
-    parser.add_argument("--output", type=str, default=OUTPUT_CSV, help=f"Output CSV path (default {OUTPUT_CSV})")
-    return parser.parse_args()
-
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
+    print("=" * 60)
+    print("  Nifty 50 Strategy Backtester")
+    print("=" * 60)
 
-    if args.from_date:
-        from_dt = date.fromisoformat(args.from_date)
-    else:
-        from_dt = date.today() - timedelta(days=args.days)
+    # Fetch data once — reused across all param combinations
+    df_raw = fetch_historical_data(months=LOOKBACK_MONTHS)
+    df     = compute_indicators(df_raw, FAST_LEN, SLOW_LEN, ATR_LEN)
 
-    to_dt = date.fromisoformat(args.to_date) if args.to_date else date.today()
+    # Build all combinations
+    keys   = list(PARAM_GRID.keys())
+    combos = list(itertools.product(*[PARAM_GRID[k] for k in keys]))
+    total_combos = len(combos)
+    print(f"Testing {total_combos} parameter combinations...\n")
 
-    print(f"Strategy config:")
-    print(f"  EMA: {config.FAST_EMA_LEN}/{config.SLOW_EMA_LEN}, ATR: {config.ATR_LEN}")
-    print(f"  Angle: ≥{config.MIN_ANGLE_DEG}° after {config.ANGLE_CONFIRM_BARS} bars")
-    print(f"  RR: 1:{config.RISK_REWARD_RATIO}, Max wait: {config.MAX_WAIT_BARS} bars")
-    print(f"  Wick retest: {config.USE_WICK_FOR_RETEST}")
+    results = []
+    start_t = time.time()
+
+    for idx, combo in enumerate(combos):
+        params = dict(zip(keys, combo))
+        trades = run_backtest(df, params)
+        metrics = compute_metrics(trades, params)
+        if metrics:
+            results.append(metrics)
+
+        # Progress
+        if (idx + 1) % 50 == 0 or (idx + 1) == total_combos:
+            elapsed = time.time() - start_t
+            pct     = (idx + 1) / total_combos * 100
+            eta     = (elapsed / (idx + 1)) * (total_combos - idx - 1)
+            print(f"  [{idx+1:>4}/{total_combos}] {pct:.0f}% done | "
+                  f"elapsed {elapsed:.0f}s | ETA {eta:.0f}s | "
+                  f"valid configs so far: {len(results)}")
+
+    print(f"\n✅ Done. {len(results)} valid configurations (≥3 trades).\n")
+
+    if not results:
+        print("⚠️  No valid configurations found. Try reducing min_angle_deg "
+              "or extending the lookback period.")
+        return
+
+    df_results = pd.DataFrame(results)
+
+    # ── Rank by profit factor (primary), then win rate (secondary) ────
+    df_results = df_results.sort_values(
+        ["profit_factor", "win_rate_pct", "total_pnl"],
+        ascending=[False, False, False]
+    ).reset_index(drop=True)
+    df_results.index += 1  # rank starts at 1
+
+    # Save full results
+    all_path = "backtest_all_results.csv"
+    df_results.to_csv(all_path)
+    print(f"📄 All results saved → {all_path}")
+
+    # Save top 20
+    top20_path = "backtest_best_configs.csv"
+    df_results.head(20).to_csv(top20_path)
+    print(f"🏆 Top 20 saved       → {top20_path}\n")
+
+    # Print top 10 to console
+    print("=" * 60)
+    print("  TOP 10 CONFIGURATIONS")
+    print("=" * 60)
+    display_cols = [
+        "min_angle_deg", "angle_confirm_bars", "risk_reward_ratio",
+        "max_wait_bars", "retest_buffer_pct",
+        "total_trades", "win_rate_pct", "profit_factor",
+        "total_pnl", "max_drawdown", "expectancy"
+    ]
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 200)
+    pd.set_option("display.float_format", "{:.2f}".format)
+    print(df_results[display_cols].head(10).to_string())
+
+    # ── Best config summary ────────────────────────────────────────────
+    best = df_results.iloc[0]
+    print("\n" + "=" * 60)
+    print("  🥇 BEST CONFIGURATION")
+    print("=" * 60)
+    print(f"  Angle threshold:    {best['min_angle_deg']}°")
+    print(f"  Confirm bars:       {best['angle_confirm_bars']}")
+    print(f"  Risk:Reward:        1:{best['risk_reward_ratio']}")
+    print(f"  Max wait bars:      {best['max_wait_bars']}")
+    print(f"  Retest buffer:      {best['retest_buffer_pct']}%")
+    print(f"  ─────────────────────────────────────")
+    print(f"  Total trades:       {int(best['total_trades'])}")
+    print(f"  Win rate:           {best['win_rate_pct']}%")
+    print(f"  Profit factor:      {best['profit_factor']}")
+    print(f"  Total P&L (est):    ₹{best['total_pnl']:.2f}  (delta-scaled, per-lot)")
+    print(f"  Max drawdown (est): ₹{best['max_drawdown']:.2f}")
+    print(f"  Expectancy:         ₹{best['expectancy']:.2f} per trade")
     print()
+    print("  To apply these settings, update config.py:")
+    print(f"    MIN_ANGLE_DEG        = {best['min_angle_deg']}")
+    print(f"    ANGLE_CONFIRM_BARS   = {int(best['angle_confirm_bars'])}")
+    print(f"    RISK_REWARD_RATIO    = {best['risk_reward_ratio']}")
+    print(f"    MAX_WAIT_BARS        = {int(best['max_wait_bars'])}")
+    print(f"    RETEST_BUFFER_PCT    = {best['retest_buffer_pct']}")
+    print("=" * 60)
 
-    # Fetch data
-    df = fetch_historical_5min(from_dt, to_dt)
-
-    if df.empty:
-        print("No data available for the specified range.")
-        sys.exit(1)
-
-    print(f"Date range: {df.index[0]:%Y-%m-%d} → {df.index[-1]:%Y-%m-%d}")
-    trading_days = df.index.normalize().nunique()
-    print(f"Trading days: {trading_days}")
-    print()
-
-    # Run backtest
-    trades = run_backtest(df)
-
-    # Output
-    write_csv(trades, args.output)
-    print_summary(trades)
+    # Warn if top config has very few trades
+    if best["total_trades"] < 10:
+        print("\n⚠️  Warning: best config has few trades — may be overfitting.")
+        print("   Consider the top config with ≥15 trades instead:")
+        robust = df_results[df_results["total_trades"] >= 15]
+        if not robust.empty:
+            r = robust.iloc[0]
+            print(f"   Angle={r['min_angle_deg']}°  "
+                  f"Confirm={int(r['angle_confirm_bars'])}  "
+                  f"RR=1:{r['risk_reward_ratio']}  "
+                  f"Wait={int(r['max_wait_bars'])}  "
+                  f"PF={r['profit_factor']:.2f}  "
+                  f"Win={r['win_rate_pct']}%  "
+                  f"Trades={int(r['total_trades'])}")
 
 
 if __name__ == "__main__":
