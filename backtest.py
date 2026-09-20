@@ -106,34 +106,46 @@ def _last_trading_day():
 def fetch_historical_data(months=6):
     """
     Fetch N months of 1-min Nifty candles from Upstox and resample to 5-min.
-    Upstox v2 historical-candle endpoint returns max ~180 days of 1-min data.
-    We fetch in monthly chunks to stay within API limits.
+    Uses 7-day chunks per API call — confirmed working at any depth up to 120+ days.
     """
     print(f"Fetching {months} months of 5-min Nifty history from Upstox...")
-    last_trade = _last_trading_day()
-    all_frames = []
+
+    last_trade  = _last_trading_day()
+    total_days  = months * 30
+    num_chunks  = (total_days // 7) + 1
+    all_frames  = []
 
     chunk_end = last_trade
-    for chunk in range(months):
-        chunk_start = chunk_end - timedelta(days=32)  # ~1 month
+    for chunk in range(num_chunks):
+        chunk_start = chunk_end - timedelta(days=7)
+        # Skip if chunk is entirely in the future or too old
+        if chunk_start > last_trade:
+            chunk_end = chunk_start - timedelta(days=1)
+            continue
+
         url = (f"{BASE_V2}/historical-candle/{ENCODED_KEY}/1minute"
-               f"/{chunk_end.strftime('%Y-%m-%d')}/{chunk_start.strftime('%Y-%m-%d')}")
+               f"/{chunk_end.strftime('%Y-%m-%d')}"
+               f"/{chunk_start.strftime('%Y-%m-%d')}")
         try:
             resp = requests.get(url, headers=_headers(), timeout=30)
             if resp.status_code == 200:
                 df_chunk = _parse_candles_1min(resp.json())
                 if not df_chunk.empty:
                     all_frames.append(df_chunk)
-                    print(f"  Chunk {chunk+1}/{months}: {len(df_chunk)} 1-min bars "
-                          f"({chunk_start} → {chunk_end})")
+                    if (chunk + 1) % 4 == 0:  # print every ~4 weeks
+                        print(f"  Week {chunk+1}/{num_chunks}: "
+                              f"{chunk_start} → {chunk_end} "
+                              f"({len(df_chunk)} bars)")
             else:
-                print(f"  Chunk {chunk+1}/{months}: HTTP {resp.status_code} — skipped")
+                print(f"  Week {chunk+1}/{num_chunks}: HTTP {resp.status_code} — "
+                      f"{resp.text[:80]}")
         except Exception as e:
-            print(f"  Chunk {chunk+1}/{months}: Error — {e}")
+            print(f"  Week {chunk+1}/{num_chunks}: Error — {e}")
+
         chunk_end = chunk_start - timedelta(days=1)
         while chunk_end.weekday() >= 5:
             chunk_end -= timedelta(days=1)
-        time.sleep(0.5)  # gentle rate limiting
+        time.sleep(0.3)  # gentle rate limiting
 
     if not all_frames:
         raise RuntimeError("No historical data fetched. Check token and connectivity.")
