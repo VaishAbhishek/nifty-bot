@@ -163,20 +163,28 @@ class SignalEngine:
                 self.wait_start_ts = None
 
         # ===== STEP 4: RETEST → ENTRY =====
-        if self.armed and flat:
-            buffer = float(fast.iloc[i]) * self.retest_buffer_pct / 100
+        # Require at least 1 full candle after arming before checking retest.
+        # Without this, the retest fires immediately on the angle-confirmation
+        # candle itself (price is still at the EMA right after crossover),
+        # causing a premature entry before price has had a chance to move away.
+        if self.armed and flat and self.wait_start_ts is not None:
+            wait_pos    = self._get_loc(df, self.wait_start_ts)
+            bars_since_arm = (i - wait_pos) if wait_pos is not None else 0
 
-            if self.armed_dir == 1:
-                retest = (low.iloc[i] <= fast.iloc[i] + buffer) if self.use_wick_for_retest \
-                         else (close.iloc[i] <= fast.iloc[i] + buffer)
-            else:
-                retest = (high.iloc[i] >= fast.iloc[i] - buffer) if self.use_wick_for_retest \
-                         else (close.iloc[i] >= fast.iloc[i] - buffer)
+            if bars_since_arm >= 1:   # at least 1 closed candle after arming
+                buffer = float(fast.iloc[i]) * self.retest_buffer_pct / 100
 
-            if retest:
-                events.append(("entry", self.armed_dir, float(close.iloc[i]), float(slow.iloc[i])))
-                self.armed = False
-                self.armed_dir = 0
-                self.wait_start_ts = None
+                if self.armed_dir == 1:
+                    retest = (low.iloc[i] <= fast.iloc[i] + buffer) if self.use_wick_for_retest \
+                             else (close.iloc[i] <= fast.iloc[i] + buffer)
+                else:
+                    retest = (high.iloc[i] >= fast.iloc[i] - buffer) if self.use_wick_for_retest \
+                             else (close.iloc[i] >= fast.iloc[i] - buffer)
+
+                if retest:
+                    events.append(("entry", self.armed_dir, float(close.iloc[i]), float(slow.iloc[i])))
+                    self.armed = False
+                    self.armed_dir = 0
+                    self.wait_start_ts = None
 
         return events

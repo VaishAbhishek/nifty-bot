@@ -343,31 +343,33 @@ def run_backtest(df, params):
                 armed_dir    = 0
                 wait_start_i = None
 
-        # Step 4: retest → entry
-        if armed and not is_force_close(ts):
-            fa  = float(fast.iloc[i])
-            buf = fa * buf_pct / 100
-            if armed_dir == 1:
-                retest = df["low"].iloc[i] <= fa + buf
-            else:
-                retest = df["high"].iloc[i] >= fa - buf
+        # Step 4: retest → entry (minimum 1 bar after arming)
+        if armed and not is_force_close(ts) and wait_start_i is not None:
+            bars_since_arm = i - wait_start_i
+            if bars_since_arm >= 1:
+                fa  = float(fast.iloc[i])
+                buf = fa * buf_pct / 100
+                if armed_dir == 1:
+                    retest = df["low"].iloc[i] <= fa + buf
+                else:
+                    retest = df["high"].iloc[i] >= fa - buf
 
-            if retest:
-                ep       = float(df["close"].iloc[i])
-                sl       = float(slow.iloc[i])
-                sl_dist  = abs(ep - sl)
-                if sl_dist < 1.0:
-                    sl_dist = 1.0
-                tp = ep + armed_dir * rr * sl_dist
+                if retest:
+                    ep       = float(df["close"].iloc[i])
+                    sl       = float(slow.iloc[i])
+                    sl_dist  = abs(ep - sl)
+                    if sl_dist < 1.0:
+                        sl_dist = 1.0
+                    tp = ep + armed_dir * rr * sl_dist
 
-                in_trade     = True
-                trade_dir    = armed_dir
-                entry_price  = ep
-                sl_price     = sl
-                target_price = tp
-                armed        = False
-                armed_dir    = 0
-                wait_start_i = None
+                    in_trade     = True
+                    trade_dir    = armed_dir
+                    entry_price  = ep
+                    sl_price     = sl
+                    target_price = tp
+                    armed        = False
+                    armed_dir    = 0
+                    wait_start_i = None
 
     return trades
 

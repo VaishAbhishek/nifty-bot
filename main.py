@@ -116,8 +116,20 @@ def main():
 def _check_intrabar_retest(engine, df, trader, now):
     """
     Check if the live (partial) candle's wick has touched the Fast EMA.
-    Uses v3 intraday endpoint (minutes/5) — includes the current in-progress bar.
+    Only fires if at least 1 full closed candle has passed since arming —
+    prevents immediate same-candle entry before price moves away from EMA.
     """
+    # Enforce minimum 1-bar wait after arming
+    if engine.wait_start_ts is not None:
+        import pandas as pd
+        wait_pos = None
+        try:
+            wait_pos = df.index.get_loc(engine.wait_start_ts)
+        except KeyError:
+            pass
+        bars_since_arm = (len(df) - 1 - wait_pos) if wait_pos is not None else 0
+        if bars_since_arm < 1:
+            return  # too soon — arm candle hasn't closed yet
     try:
         token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
         resp = requests.get(
