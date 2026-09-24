@@ -40,5 +40,5 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 APPROVAL_TIMEOUT_SECONDS = 60  # 1 minute, auto-executes if no response
 
 # ===== RISK CONTROL =====
-MAX_CONSECUTIVE_LOSSES = 2     # Pause new entries after this many losses in a row
+MAX_CONSECUTIVE_LOSSES = 4     # Pause new entries after this many losses in a row
                                 # Auto-resumes the next trading day
