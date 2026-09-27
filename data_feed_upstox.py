@@ -80,19 +80,29 @@ def _resample_to_5min(df_1min):
     return df_5min.between_time("09:15", "15:30")
 
 
-def _get_yesterday_candles():
+def _get_history_candles():
     """
-    Fetch last 2 trading days of 1-min candles and resample to 5-min.
-    2 days = ~150 bars — more than enough to seed EMA(9), EMA(15), ATR(14).
+    Fetch last 10 trading days of 1-min candles and resample to 5-min.
+
+    WHY 10 DAYS (not 2):
+    With only 2 days, EMA(9) and EMA(15) are seeded from ~150 bars.
+    TradingView seeds from months of data. The resulting EMA offset causes:
+      - Phantom micro-crossovers (fast briefly above slow while trending down)
+      - fastEMA values slightly below TradingView's → retest threshold never triggers
+    10 days = ~750 bars. EMAs converge to TradingView values within the first
+    20-30 bars of each session, well before any trade signal can fire.
     """
     last_trade = _last_trading_day()
-    two_days_before = _prev_trading_day(_prev_trading_day(last_trade))
+    # Walk back 10 trading days
+    start = last_trade
+    for _ in range(9):
+        start = _prev_trading_day(start)
 
     to_date   = last_trade.strftime("%Y-%m-%d")
-    from_date = two_days_before.strftime("%Y-%m-%d")
+    from_date = start.strftime("%Y-%m-%d")
     url = f"{BASE_V2}/historical-candle/{ENCODED_KEY}/1minute/{to_date}/{from_date}"
 
-    resp = requests.get(url, headers=_headers(), timeout=20)
+    resp = requests.get(url, headers=_headers(), timeout=30)
     resp.raise_for_status()
     df_1min = _parse_candles(resp.json())
     return _resample_to_5min(df_1min)
@@ -123,9 +133,9 @@ def get_recent_candles():
     During market hours:  returns yesterday + today's candles merged.
     Partial in-progress candles are always dropped.
     """
-    # Yesterday (EMA seeding)
+    # Historical candles for EMA seeding (10 trading days)
     try:
-        df_hist = _get_yesterday_candles()
+        df_hist = _get_history_candles()
     except Exception as e:
         raise RuntimeError(f"Historical candle fetch failed: {e}")
 

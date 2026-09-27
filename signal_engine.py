@@ -8,6 +8,9 @@ Key fixes vs original:
 3. Gap filter matches Pine exactly: only the first candle of a new day with a gap
    is skipped (not 3 candles).
 4. wait_start_ts is timestamp-based — fixes timeout drift.
+5. [FIX 2026-09-27] Retest (Step 4) evaluated BEFORE invalidation (Step 3) —
+   matches Pine Script intrabar limit-order fill behaviour. Prevents missed trades
+   when a retest candle also closes through the Slow EMA.
 """
 
 import numpy as np
@@ -131,7 +134,11 @@ class SignalEngine:
 
                     passed = (angle_deg >= self.min_angle_deg if self.pending_dir == 1
                               else angle_deg <= -self.min_angle_deg)
-                    events.append(("angle_check", self.pending_dir, angle_deg, passed))
+                    # ema_reversed: EMA moved opposite direction to the crossover after the cross.
+                    # e.g. a bullish crossover but EMA sloped down = choppy/fake cross.
+                    ema_reversed = (self.pending_dir == 1 and angle_deg < 0) or \
+                                   (self.pending_dir == -1 and angle_deg > 0)
+                    events.append(("angle_check", self.pending_dir, angle_deg, passed, ema_reversed))
 
                     if passed:
                         self.armed = True
@@ -147,26 +154,12 @@ class SignalEngine:
                     self.pending_dir = 0
                     self.pending_cross_ts = None
 
-        # ===== STEP 3: INVALIDATION WHILE ARMED =====
-        if self.armed and self.wait_start_ts is not None:
-            wait_pos = self._get_loc(df, self.wait_start_ts)
-            bars_waited = (i - wait_pos) if wait_pos is not None else self.max_wait_bars + 1
-
-            timed_out    = bars_waited > self.max_wait_bars
-            trend_broken = (close.iloc[i] < slow.iloc[i]) if self.armed_dir == 1 else (close.iloc[i] > slow.iloc[i])
-
-            if timed_out or trend_broken:
-                reason = "timeout" if timed_out else "trend_break"
-                events.append(("invalidated", reason))
-                self.armed = False
-                self.armed_dir = 0
-                self.wait_start_ts = None
-
-        # ===== STEP 4: RETEST → ENTRY =====
-        # Require at least 1 full candle after arming before checking retest.
-        # Without this, the retest fires immediately on the angle-confirmation
-        # candle itself (price is still at the EMA right after crossover),
-        # causing a premature entry before price has had a chance to move away.
+        # ===== STEP 4: RETEST → ENTRY (evaluated BEFORE invalidation) =====
+        # Pine Script fills limit orders intrabar when wick touches fastEMA,
+        # BEFORE the bar close is evaluated against the Slow EMA.
+        # Checking retest first prevents invalidation from swallowing valid entries
+        # on bars that touch fastEMA but also close through slowEMA.
+        entry_fired = False
         if self.armed and flat and self.wait_start_ts is not None:
             wait_pos    = self._get_loc(df, self.wait_start_ts)
             bars_since_arm = (i - wait_pos) if wait_pos is not None else 0
@@ -186,5 +179,21 @@ class SignalEngine:
                     self.armed = False
                     self.armed_dir = 0
                     self.wait_start_ts = None
+                    entry_fired = True
+
+        # ===== STEP 3: INVALIDATION WHILE ARMED (only if retest did NOT fire) =====
+        if not entry_fired and self.armed and self.wait_start_ts is not None:
+            wait_pos = self._get_loc(df, self.wait_start_ts)
+            bars_waited = (i - wait_pos) if wait_pos is not None else self.max_wait_bars + 1
+
+            timed_out    = bars_waited > self.max_wait_bars
+            trend_broken = (close.iloc[i] < slow.iloc[i]) if self.armed_dir == 1 else (close.iloc[i] > slow.iloc[i])
+
+            if timed_out or trend_broken:
+                reason = "timeout" if timed_out else "trend_break"
+                events.append(("invalidated", reason))
+                self.armed = False
+                self.armed_dir = 0
+                self.wait_start_ts = None
 
         return events

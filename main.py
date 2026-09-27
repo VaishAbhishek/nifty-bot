@@ -87,9 +87,12 @@ def main():
         )
 
         latest_candle_time = df.index[-1]
+        # Normalize to UTC microseconds for reliable equality comparison
+        # (avoids tz-aware vs naive drift causing duplicate processing)
+        latest_candle_utc = df.index[-1].tz_convert("UTC") if hasattr(df.index[-1], 'tz_convert') else df.index[-1]
 
         # ── Same candle still running — check intrabar retest & monitor ──
-        if latest_candle_time == last_seen_candle_time:
+        if latest_candle_utc == last_seen_candle_time:
             if not trader.is_flat():
                 _monitor_open_position(trader, now)
             elif engine.armed and config.USE_WICK_FOR_RETEST:
@@ -98,13 +101,27 @@ def main():
             continue
 
         # ── New closed candle ──────────────────────────────────────────
-        last_seen_candle_time = latest_candle_time
+        last_seen_candle_time = latest_candle_utc
+        fast_ema_val = df["fast_ema"].iloc[-1]
+        slow_ema_val = df["slow_ema"].iloc[-1]
         print(f"[{now:%H:%M:%S}] New candle: {latest_candle_time:%H:%M} "
-              f"close={df['close'].iloc[-1]:.2f}")
+              f"close={df['close'].iloc[-1]:.2f} "
+              f"fast={fast_ema_val:.2f} slow={slow_ema_val:.2f}")
 
         events = engine.process(df, flat=trader.is_flat())
         for event in events:
             _handle_event(event, trader, now)
+
+        # ── EOD: clear armed state at force-close time ───────────────────
+        # force-close already handles open positions; this handles the armed state
+        # which would otherwise vanish silently at end of day with no log entry.
+        if is_force_close_time(now) and engine.armed:
+            print(f"[{now:%H:%M:%S}] EOD: armed {('CE' if engine.armed_dir == 1 else 'PE')} "
+                  f"setup cleared (force-close time — no retest occurred)")
+            telegram_bot.send_message(
+                f"⏰ EOD: Armed {'CE' if engine.armed_dir == 1 else 'PE'} setup expired at force-close. No trade taken."
+            )
+            engine.reset_day()
 
         if not trader.is_flat():
             _monitor_open_position(trader, now)
@@ -177,10 +194,13 @@ def _handle_event(event, trader, now):
     kind = event[0]
 
     if kind == "angle_check":
-        _, direction, angle_deg, passed = event
+        # angle_check tuple: (kind, direction, angle_deg, passed, ema_reversed)
+        _, direction, angle_deg, passed = event[0], event[1], event[2], event[3]
+        ema_reversed = event[4] if len(event) > 4 else False
         dir_str = "Bullish" if direction == 1 else "Bearish"
         status  = "PASSED ✅" if passed else "rejected"
-        print(f"[{now:%H:%M:%S}] {dir_str} crossover, angle={angle_deg:.1f}°, {status}")
+        reversal_note = " (EMA reversed after cross — choppy)" if ema_reversed and not passed else ""
+        print(f"[{now:%H:%M:%S}] {dir_str} crossover, angle={angle_deg:.1f}°, {status}{reversal_note}")
 
     elif kind == "armed":
         _, direction = event
