@@ -12,7 +12,7 @@ FAST_EMA_LEN = 9
 SLOW_EMA_LEN = 15
 ATR_LEN = 14
 MIN_ANGLE_DEG = 7              # Entry threshold (lowered from 30 per latest decision)
-ANGLE_CONFIRM_BARS = 3         # Candles after crossover to confirm angle (test 1/2/3)
+ANGLE_CONFIRM_BARS = 2         # Candles after crossover to confirm angle (test 1/2/3)
 RETEST_BUFFER_PCT = 0.0        # 0 = exact touch
 USE_WICK_FOR_RETEST = True
 MAX_WAIT_BARS = 15
