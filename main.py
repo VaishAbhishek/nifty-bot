@@ -97,6 +97,9 @@ def main():
                 _monitor_open_position(trader, now)
             elif engine.armed and config.USE_WICK_FOR_RETEST:
                 _check_intrabar_retest(engine, df, trader, now)
+            elif trader.is_flat() and not engine.armed and engine.pending_dir == 0:
+                # Not armed yet — check if a crossover is forming intrabar
+                _check_intrabar_crossover(engine, df, now)
             time.sleep(config.POLL_SECONDS)
             continue
 
@@ -128,6 +131,95 @@ def main():
 
         time.sleep(config.POLL_SECONDS)
 
+
+
+
+
+# ── Intrabar early-warning crossover check ────────────────────────────────────
+
+_intrabar_warned_bar_ts = None   # module-level guard — warn once per live bar
+
+def _check_intrabar_crossover(engine, df, now):
+    """
+    Called every 30s during the current live bar (before it closes).
+    Appends the partial candle to df, recomputes EMAs, and checks if a
+    crossover is forming right now.
+
+    If yes: sends a Telegram early-warning (up to ~4.5 min before bar close).
+    This is purely informational — no trade fires until bar close + angle check.
+    Fires at most once per bar (guarded by _intrabar_warned_bar_ts).
+    """
+    global _intrabar_warned_bar_ts
+    try:
+        token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
+        resp = requests.get(
+            "https://api.upstox.com/v3/historical-candle/intraday"
+            "/NSE_INDEX%7CNifty%2050/minutes/5",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return
+        candles = resp.json().get("data", {}).get("candles", [])
+        if not candles:
+            return
+
+        # Last candle is the current in-progress (partial) bar
+        live = candles[-1]   # [ts, open, high, low, close, vol, oi]
+        live_ts    = live[0]
+        live_close = float(live[4])
+
+        # Only warn once per live bar
+        if _intrabar_warned_bar_ts == live_ts:
+            return
+
+        # Append partial candle to df and recompute EMAs
+        import pandas as pd
+        live_index = pd.Timestamp(live_ts)
+        if live_index.tzinfo is None:
+            live_index = live_index.tz_localize("Asia/Kolkata")
+        else:
+            live_index = live_index.tz_convert("Asia/Kolkata")
+
+        live_row = pd.DataFrame(
+            {"open": [float(live[1])], "high": [float(live[2])],
+             "low": [float(live[3])], "close": [live_close]},
+            index=[live_index]
+        )
+        df_live = pd.concat([df, live_row])
+        df_live = signal_engine.compute_indicators(
+            df_live, config.FAST_EMA_LEN, config.SLOW_EMA_LEN, config.ATR_LEN
+        )
+
+        fast = df_live["fast_ema"]
+        slow = df_live["slow_ema"]
+        n = len(df_live) - 1
+
+        cross_up   = fast.iloc[n-1] < slow.iloc[n-1] and fast.iloc[n] > slow.iloc[n]
+        cross_down = fast.iloc[n-1] > slow.iloc[n-1] and fast.iloc[n] < slow.iloc[n]
+
+        if cross_up or cross_down:
+            _intrabar_warned_bar_ts = live_ts
+            direction = "Bullish (CE)" if cross_up else "Bearish (PE)"
+            fast_now  = fast.iloc[n]
+            slow_now  = slow.iloc[n]
+            # Compute minutes remaining in the current 5-min bar
+            bar_open = live_index.replace(second=0, microsecond=0)
+            elapsed_sec = max(0, (now - bar_open.replace(tzinfo=now.tzinfo)).total_seconds())
+            mins_left = max(0, 5 - int(elapsed_sec // 60))
+
+            msg = (
+                f"⚡ Early warning: {direction} crossover forming!\n"
+                f"Live price: {live_close:.2f}\n"
+                f"Fast EMA: {fast_now:.2f} | Slow EMA: {slow_now:.2f}\n"
+                f"~{mins_left} min until bar close — wait for angle confirmation."
+            )
+            print(f"[{now:%H:%M:%S}] ⚡ INTRABAR crossover developing: {direction} "
+                  f"live={live_close:.2f} fast={fast_now:.2f} slow={slow_now:.2f}")
+            telegram_bot.send_message(msg)
+
+    except Exception as e:
+        print(f"[{now:%H:%M:%S}] Intrabar crossover check error: {e}")
 
 
 def _check_intrabar_retest(engine, df, trader, now):
