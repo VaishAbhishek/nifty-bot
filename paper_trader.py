@@ -1,7 +1,7 @@
 """
-Simulates trade execution for paper trading: tracks an open position,
-checks SL/target/EOD-close each candle, logs every trade to CSV, and
-enforces the consecutive-loss pause (auto-resumes next trading day).
+Simulates trade execution for paper trading: tracks open positions (supports
+multiple simultaneous positions), checks SL/target/EOD-close each candle,
+logs every trade to CSV, and enforces the consecutive-loss pause.
 """
 
 import csv
@@ -12,9 +12,9 @@ import config
 
 class PaperTrader:
     def __init__(self):
-        self.position = None  # dict: direction, strike, option_type, entry_premium, sl, target, entry_time
+        self.positions = []   # list of open position dicts — supports multiple simultaneous trades
         self.consecutive_losses = 0
-        self.paused_for_day = None  # date when pause was triggered; resumes automatically the next day
+        self.paused_for_day = None
         self._init_log()
 
     def _init_log(self):
@@ -29,13 +29,18 @@ class PaperTrader:
                 ])
 
     def is_flat(self):
-        return self.position is None
+        """True only when there are zero open positions."""
+        return len(self.positions) == 0
+
+    @property
+    def position(self):
+        """Backwards-compat shim: return first open position or None."""
+        return self.positions[0] if self.positions else None
 
     def is_paused(self, today):
         if self.paused_for_day is None:
             return False
         if today > self.paused_for_day:
-            # New trading day - auto-resume
             self.paused_for_day = None
             self.consecutive_losses = 0
             return False
@@ -45,12 +50,11 @@ class PaperTrader:
         entry_premium = strike_info["premium"]
         sl_distance_underlying = abs(underlying_entry - underlying_sl)
 
-        # Scale by approximate delta for near-ATM options
         delta = 0.45
         sl_premium     = max(entry_premium - (sl_distance_underlying * delta), 0.5)
         target_premium = entry_premium + (sl_distance_underlying * delta * rr_ratio)
 
-        self.position = {
+        pos = {
             "direction":      direction,
             "strike":         strike_info["strike"],
             "option_type":    strike_info["option_type"],
@@ -58,29 +62,30 @@ class PaperTrader:
             "sl_premium":     sl_premium,
             "target_premium": target_premium,
             "entry_time":     now,
-            "instrument_key": strike_info.get("instrument_key", ""),  # Upstox key for live LTP
+            "instrument_key": strike_info.get("instrument_key", ""),
         }
-        return self.position
+        self.positions.append(pos)
+        return pos
 
-        self.position = {
-            "direction": direction,
-            "strike": strike_info["strike"],
-            "option_type": strike_info["option_type"],
-            "entry_premium": entry_premium,
-            "sl_premium": sl_premium,
-            "target_premium": target_premium,
-            "entry_time": now,
-        }
-        return self.position
-
-    def check_exit(self, current_premium, now, force_close=False):
-        """Call every candle while a position is open. Returns exit info dict or None."""
-        if self.position is None:
+    def check_exit(self, current_premium, now, force_close=False, instrument_key=None):
+        """
+        Check exit for a specific position (matched by instrument_key) or
+        the first position if instrument_key is None.
+        Returns exit info dict on close, None if no exit triggered.
+        """
+        if not self.positions:
             return None
 
-        pos = self.position
-        exit_reason = None
+        pos = None
+        if instrument_key:
+            for p in self.positions:
+                if p.get("instrument_key") == instrument_key:
+                    pos = p
+                    break
+        if pos is None:
+            pos = self.positions[0]
 
+        exit_reason = None
         if force_close:
             exit_reason = "EOD"
         elif current_premium <= pos["sl_premium"]:
@@ -105,8 +110,31 @@ class PaperTrader:
 
         exit_info = {**pos, "exit_premium": current_premium, "exit_time": now,
                      "exit_reason": exit_reason, "pnl_per_lot": pnl_per_lot, "result": result}
-        self.position = None
+        self.positions.remove(pos)
         return exit_info
+
+    def check_all_exits(self, get_premium_fn, now, force_close=False):
+        """
+        Monitor all open positions and close any that hit SL / Target / EOD.
+        get_premium_fn(instrument_key) -> current premium float or None.
+        Returns list of exit_info dicts for every position closed this call.
+        """
+        closed = []
+        for pos in list(self.positions):
+            try:
+                current_premium = get_premium_fn(pos.get("instrument_key", ""))
+                if current_premium is None:
+                    continue
+            except Exception:
+                continue
+            exit_info = self.check_exit(
+                current_premium, now,
+                force_close=force_close,
+                instrument_key=pos.get("instrument_key")
+            )
+            if exit_info:
+                closed.append(exit_info)
+        return closed
 
     def _log_trade(self, pos, exit_premium, exit_time, exit_reason, pnl_per_lot, result):
         with open(config.TRADE_LOG_PATH, "a", newline="") as f:

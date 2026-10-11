@@ -111,13 +111,11 @@ def main():
               f"close={df['close'].iloc[-1]:.2f} "
               f"fast={fast_ema_val:.2f} slow={slow_ema_val:.2f}")
 
-        events = engine.process(df, flat=trader.is_flat())
+        events = engine.process(df, flat=True)   # flat=True: engine signals always; positions managed separately
         for event in events:
             _handle_event(event, trader, now)
 
         # ── EOD: clear armed state at force-close time ───────────────────
-        # force-close already handles open positions; this handles the armed state
-        # which would otherwise vanish silently at end of day with no log entry.
         if is_force_close_time(now) and engine.armed:
             print(f"[{now:%H:%M:%S}] EOD: armed {('CE' if engine.armed_dir == 1 else 'PE')} "
                   f"setup cleared (force-close time — no retest occurred)")
@@ -126,8 +124,8 @@ def main():
             )
             engine.reset_day()
 
-        if not trader.is_flat():
-            _monitor_open_position(trader, now)
+        # Monitor ALL open positions (supports multiple simultaneous trades)
+        _monitor_all_positions(trader, now)
 
         time.sleep(config.POLL_SECONDS)
 
@@ -309,6 +307,17 @@ def _handle_event(event, trader, now):
     elif kind == "skipped_gap":
         print(f"[{now:%H:%M:%S}] Crossover skipped — gap candle")
 
+    elif kind == "skipped_crossover":
+        _, direction, reason = event
+        dir_str = "Bullish (CE)" if direction == 1 else "Bearish (PE)"
+        reason_map = {
+            "already_armed":  "a setup is already armed",
+            "pending_exists": "waiting on earlier crossover angle",
+        }
+        reason_str = reason_map.get(reason, reason)
+        print(f"[{now:%H:%M:%S}] {dir_str} crossover SKIPPED — {reason_str}")
+
+
     elif kind == "entry":
         _, direction, underlying_entry, underlying_sl = event
         _process_entry(direction, underlying_entry, underlying_sl, trader, now)
@@ -355,26 +364,18 @@ def _process_entry(direction, underlying_entry, underlying_sl, trader, now):
     )
 
 
-def _monitor_open_position(trader, now):
-    pos = trader.position
-    if not pos:
-        return
-
-    # Use real Upstox LTP for the open option position
-    try:
-        instrument_key  = pos.get("instrument_key", "")
-        current_premium = option_chain.get_option_ltp(instrument_key)
-        if current_premium is None:
-            print(f"[{now:%H:%M:%S}] Could not fetch current premium (None returned)")
-            return
-    except Exception as e:
-        print(f"[{now:%H:%M:%S}] Premium fetch failed: {e}")
+def _monitor_all_positions(trader, now):
+    """Monitor ALL open positions and handle exits. Supports multiple simultaneous trades."""
+    if trader.is_flat():
         return
 
     force_close = is_force_close_time(now)
-    exit_info   = trader.check_exit(current_premium, now, force_close=force_close)
+    count = len(trader.positions)
+    if count > 1:
+        print(f"[{now:%H:%M:%S}] Monitoring {count} open positions")
 
-    if exit_info:
+    closed = trader.check_all_exits(option_chain.get_option_ltp, now, force_close=force_close)
+    for exit_info in closed:
         emoji = "🟢" if exit_info["result"] == "WIN" else "🔴"
         telegram_bot.send_message(
             f"{emoji} PAPER trade closed: {exit_info['result']} ({exit_info['exit_reason']})\n"

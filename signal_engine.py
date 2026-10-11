@@ -109,12 +109,20 @@ class SignalEngine:
         gap_bar    = is_gap_bar(df, i)
 
         # ===== STEP 1: CROSSOVER → PENDING =====
-        # Matches Pine exactly: not armed, flat, no existing pending
-        if (cross_up or cross_down) and not gap_bar and not self.armed and flat and self.pending_dir == 0:
+        # No longer requires flat=True — multiple simultaneous positions allowed.
+        # Only blocks if already armed or pending (one setup chain at a time).
+        if (cross_up or cross_down) and not gap_bar and not self.armed and self.pending_dir == 0:
             self.pending_dir = 1 if cross_up else -1
             self.pending_cross_ts = ts
         elif (cross_up or cross_down) and gap_bar:
             events.append(("skipped_gap", 1 if cross_up else -1))
+        elif (cross_up or cross_down) and not gap_bar:
+            # Valid crossover geometry but engine is busy with an existing setup
+            direction = 1 if cross_up else -1
+            if self.armed:
+                events.append(("skipped_crossover", direction, "already_armed"))
+            elif self.pending_dir != 0:
+                events.append(("skipped_crossover", direction, "pending_exists"))
 
         # ===== STEP 2: ANGLE CONFIRMATION =====
         if self.pending_dir != 0 and self.pending_cross_ts is not None:
