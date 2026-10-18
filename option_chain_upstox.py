@@ -28,20 +28,91 @@ def _headers():
     }
 
 
+def _try_expiry_candidates():
+    """
+    Generate candidate expiry dates to try, in chronological order.
+    Covers today through the next 14 calendar days.
+    NSE weekly expiry is normally Tuesday; on holidays it shifts to Monday
+    (or occasionally Wednesday). Rather than maintaining a holiday calendar,
+    we probe dates and take the first one with live LTP data.
+    """
+    today = datetime.date.today()
+    # Weekdays only (Mon-Fri) from today through next 14 days
+    candidates = []
+    for offset in range(15):
+        d = today + datetime.timedelta(days=offset)
+        if d.weekday() < 5:   # Mon=0 ... Fri=4
+            candidates.append(d.strftime("%Y-%m-%d"))
+    return candidates
+
+
+def discover_nearest_expiry(direction=1):
+    """
+    Finds the nearest Nifty weekly expiry that actually has live LTP data.
+
+    Handles all cases automatically:
+      - Normal Tuesday expiry
+      - Holiday shift to Monday
+      - Holiday shift to Wednesday
+      - Weekend / after-hours (returns None if market is fully closed)
+
+    Returns (expiry_date_str, candidates_list) or raises RuntimeError.
+    """
+    side_key = "call_options" if direction == 1 else "put_options"
+
+    for expiry_date in _try_expiry_candidates():
+        try:
+            data = fetch_option_chain(expiry_date)
+        except Exception:
+            continue
+
+        # Check if this expiry has any strikes with real LTP
+        for row in data.get("data", []):
+            side = row.get(side_key, {})
+            if side and side.get("market_data", {}).get("ltp", 0) > 0:
+                return expiry_date   # found a live expiry
+
+    raise RuntimeError(
+        "Could not find any Nifty weekly expiry with live LTP data. "
+        "Market is likely closed or Upstox data is unavailable."
+    )
+
+
 def get_current_week_expiry():
     """
-    Nifty weekly options expire every TUESDAY (effective September 1, 2025).
-    Returns this week's Tuesday as 'YYYY-MM-DD'.
-    If today is Tuesday and market has closed (after 3:30 PM IST),
-    returns next Tuesday.
+    Returns the nearest upcoming expiry as a 'YYYY-MM-DD' string.
+    Now a thin wrapper around discover_nearest_expiry() so holiday
+    shifts (e.g. Tuesday holiday → Monday expiry) are handled automatically.
+    Falls back to static Tuesday calculation when market is closed
+    (e.g. weekends) since discover_nearest_expiry needs live data.
     """
-    today    = datetime.date.today()
-    now_ist  = datetime.datetime.now(IST)
-    days_to  = (1 - today.weekday()) % 7   # 1 = Tuesday
-    if days_to == 0 and now_ist.hour >= 15 and now_ist.minute >= 30:
-        days_to = 7
-    expiry = today + datetime.timedelta(days=days_to)
+    today   = datetime.date.today()
+    now_ist = datetime.datetime.now(IST)
+    market_open = datetime.time(9, 15)
+    market_close = datetime.time(15, 30)
+    is_market_hours = (
+        today.weekday() < 5 and
+        market_open <= now_ist.time() <= market_close
+    )
+
+    if is_market_hours:
+        try:
+            return discover_nearest_expiry()
+        except Exception:
+            pass  # fall through to static calculation
+
+    # Static fallback: nearest Tuesday (used on weekends / after-hours)
+    days_to_tuesday = (1 - today.weekday()) % 7
+    if days_to_tuesday == 0 and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 30)):
+        days_to_tuesday = 7
+    expiry = today + datetime.timedelta(days=days_to_tuesday)
     return expiry.strftime("%Y-%m-%d")
+
+
+def get_next_week_expiry():
+    """Returns the Tuesday 7 days after get_current_week_expiry()."""
+    curr = datetime.datetime.strptime(get_current_week_expiry(), "%Y-%m-%d").date()
+    return (curr + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
 
 
 def fetch_option_chain(expiry_date=None):
@@ -70,7 +141,10 @@ def find_strike_near_premium(direction, target_premium=None):
     Find the CE or PE strike whose current LTP is closest to target_premium.
 
     direction: 1 = bullish (buy CE), -1 = bearish (buy PE)
-    target_premium: defaults to config.TARGET_PREMIUM (₹95)
+    target_premium: defaults to config.TARGET_PREMIUM
+
+    Dynamically discovers the actual expiry date that has live LTP data —
+    handles Tuesday holidays (Monday expiry), Wednesday shifts, etc.
 
     Returns dict:
         strike, premium (real LTP), option_type, expiry,
@@ -79,41 +153,43 @@ def find_strike_near_premium(direction, target_premium=None):
     if target_premium is None:
         target_premium = config.TARGET_PREMIUM
 
-    expiry_date = get_current_week_expiry()
-    data        = fetch_option_chain(expiry_date)
-
+    option_type = "CE" if direction == 1 else "PE"
     side_key    = "call_options" if direction == 1 else "put_options"
-    option_type = "CE"           if direction == 1 else "PE"
 
-    candidates = []
-    for row in data.get("data", []):
-        side = row.get(side_key)
-        if not side:
+    # Try expiry dates dynamically: Mon/Tue/Wed of current + next week
+    for expiry_date in _try_expiry_candidates():
+        try:
+            data = fetch_option_chain(expiry_date)
+        except Exception:
             continue
 
-        market_data = side.get("market_data", {})
-        ltp = market_data.get("ltp", 0)
-        if not ltp or ltp <= 0:
-            continue
+        candidates = []
+        for row in data.get("data", []):
+            side = row.get(side_key)
+            if not side:
+                continue
+            market_data = side.get("market_data", {})
+            ltp = market_data.get("ltp", 0)
+            if not ltp or ltp <= 0:
+                continue
+            candidates.append({
+                "strike":         row.get("strike_price"),
+                "premium":        round(float(ltp), 2),
+                "option_type":    option_type,
+                "expiry":         expiry_date,
+                "instrument_key": side.get("instrument_key", ""),
+                "bid":            market_data.get("bid_price", 0),
+                "ask":            market_data.get("ask_price", 0),
+            })
 
-        candidates.append({
-            "strike":         row.get("strike_price"),
-            "premium":        round(float(ltp), 2),
-            "option_type":    option_type,
-            "expiry":         expiry_date,
-            "instrument_key": side.get("instrument_key", ""),
-            "bid":            market_data.get("bid_price", 0),
-            "ask":            market_data.get("ask_price", 0),
-        })
+        if candidates:
+            best = min(candidates, key=lambda c: abs(c["premium"] - target_premium))
+            return best
 
-    if not candidates:
-        raise RuntimeError(
-            f"No valid {option_type} strikes found for expiry {expiry_date}. "
-            f"Market might be closed or data unavailable."
-        )
-
-    best = min(candidates, key=lambda c: abs(c["premium"] - target_premium))
-    return best
+    raise RuntimeError(
+        f"No valid {option_type} strikes with LTP > 0 found in the next 14 days. "
+        f"Market is likely closed or Upstox data is unavailable."
+    )
 
 
 def get_option_ltp(instrument_key):
