@@ -163,6 +163,9 @@ def get_recent_candles():
     return df
 
 
+NIFTY_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
+
+
 def get_ltp(instrument_key):
     """Fetch current Last Traded Price for any Upstox instrument key."""
     resp = requests.get(
@@ -175,3 +178,16 @@ def get_ltp(instrument_key):
     data = resp.json().get("data", {})
     key  = list(data.keys())[0] if data else None
     return data[key].get("last_price") if key else None
+
+
+def get_nifty_ltp():
+    """
+    Fetch the current Nifty 50 index Last Traded Price in real-time.
+    Used for intrabar EMA-touch detection — much faster than polling
+    the intraday candle endpoint, which only updates at bar boundaries.
+    Returns None on any error (caller should handle gracefully).
+    """
+    try:
+        return get_ltp(NIFTY_INSTRUMENT_KEY)
+    except Exception:
+        return None

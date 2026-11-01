@@ -94,13 +94,22 @@ def main():
         # ── Same candle still running — check intrabar retest & monitor ──
         if latest_candle_utc == last_seen_candle_time:
             if not trader.is_flat():
+                # Position open — check exits fast (SL/target can hit within seconds)
                 _monitor_all_positions(trader, now)
-            elif engine.armed and config.USE_WICK_FOR_RETEST:
-                _check_intrabar_retest(engine, df, trader, now)
+                sleep_secs = config.POSITION_POLL_SECONDS
+            elif engine.armed:
+                # Armed — real-time LTP-based retest: fires at the exact tick price touches EMA
+                _check_ltp_retest(engine, df, trader, now)
+                # After _check_ltp_retest, engine.armed may now be False (entry fired).
+                # Use fast poll if still armed, normal poll if entry fired or not armed.
+                sleep_secs = config.LTP_POLL_SECONDS if engine.armed else config.POLL_SECONDS
             elif trader.is_flat() and not engine.armed and engine.pending_dir == 0:
-                # Not armed yet — check if a crossover is forming intrabar
+                # Not armed yet — check if a crossover is forming intrabar (informational only)
                 _check_intrabar_crossover(engine, df, now)
-            time.sleep(config.POLL_SECONDS)
+                sleep_secs = config.POLL_SECONDS
+            else:
+                sleep_secs = config.POLL_SECONDS
+            time.sleep(sleep_secs)
             continue
 
         # ── New closed candle ──────────────────────────────────────────
@@ -220,15 +229,21 @@ def _check_intrabar_crossover(engine, df, now):
         print(f"[{now:%H:%M:%S}] Intrabar crossover check error: {e}")
 
 
-def _check_intrabar_retest(engine, df, trader, now):
+def _check_ltp_retest(engine, df, trader, now):
     """
-    Check if the live (partial) candle's wick has touched the Fast EMA.
-    Only fires if at least 1 full closed candle has passed since arming —
-    prevents immediate same-candle entry before price moves away from EMA.
+    Real-time EMA touch detection using the Nifty 50 LTP (tick price).
+
+    Why this is better than reading the partial candle's high/low:
+    - The LTP endpoint reflects the *current* market price, not a bar aggregate.
+    - We fire the entry at the exact moment price touches the EMA, not at bar close.
+    - Fast EMA is fixed for the entire live bar (computed from closed candles only),
+      so we can compare LTP against it directly without recomputing anything.
+
+    Guard: requires at least 1 fully closed candle since arming — prevents entering
+    on the same candle that generated the crossover before price has moved away.
     """
     # Enforce minimum 1-bar wait after arming
     if engine.wait_start_ts is not None:
-        import pandas as pd
         wait_pos = None
         try:
             wait_pos = df.index.get_loc(engine.wait_start_ts)
@@ -237,45 +252,40 @@ def _check_intrabar_retest(engine, df, trader, now):
         bars_since_arm = (len(df) - 1 - wait_pos) if wait_pos is not None else 0
         if bars_since_arm < 1:
             return  # too soon — arm candle hasn't closed yet
+
     try:
-        token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
-        resp = requests.get(
-            "https://api.upstox.com/v3/historical-candle/intraday"
-            "/NSE_INDEX%7CNifty%2050/minutes/5",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return
-        candles = resp.json().get("data", {}).get("candles", [])
-        if not candles:
+        ltp = data_feed.get_nifty_ltp()
+        if ltp is None:
             return
 
-        # Last candle is the current in-progress bar
-        live = candles[-1]   # [ts, open, high, low, close, vol, oi]
-        live_high  = float(live[2])
-        live_low   = float(live[3])
-        live_close = float(live[4])
-
+        # EMA values are fixed for the current live bar — computed from closed candles
         fast_ema = float(df["fast_ema"].iloc[-1])
         slow_ema = float(df["slow_ema"].iloc[-1])
         buffer   = fast_ema * config.RETEST_BUFFER_PCT / 100
 
         retest = False
-        if engine.armed_dir == 1 and live_low <= fast_ema + buffer:
+        if engine.armed_dir == 1 and ltp <= fast_ema + buffer:
+            # Bullish setup: price pulled back down to touch the Fast EMA
             retest = True
-        elif engine.armed_dir == -1 and live_high >= fast_ema - buffer:
+        elif engine.armed_dir == -1 and ltp >= fast_ema - buffer:
+            # Bearish setup: price bounced up to touch the Fast EMA
             retest = True
 
         if retest:
             direction = engine.armed_dir
+            print(
+                f"[{now:%H:%M:%S}] 🎯 LTP retest detected! "
+                f"LTP={ltp:.2f} fast_ema={fast_ema:.2f} "
+                f"({'bullish' if direction == 1 else 'bearish'})"
+            )
             engine.armed         = False
             engine.armed_dir     = 0
             engine.wait_start_ts = None
-            _handle_event(("entry", direction, live_close, slow_ema), trader, now)
+            # Entry price = actual LTP at touch (not candle close)
+            _handle_event(("entry", direction, ltp, slow_ema), trader, now)
 
     except Exception as e:
-        print(f"[{now:%H:%M:%S}] Intrabar retest error: {e}")
+        print(f"[{now:%H:%M:%S}] LTP retest check error: {e}")
 
 
 # ── Event handler ──────────────────────────────────────────────────────────

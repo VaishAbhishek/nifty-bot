@@ -25,6 +25,8 @@ FORCE_CLOSE_MINUTE = 15
 UNDERLYING_TICKER = "NSE_INDEX|Nifty 50"   # Upstox instrument key
 CANDLE_INTERVAL   = "5m"
 POLL_SECONDS      = 30
+LTP_POLL_SECONDS      = 5    # Faster poll interval when armed and watching for EMA touch
+POSITION_POLL_SECONDS = 10   # Poll interval when holding an open position (faster exit detection)
 
 # ===== OPTIONS (Upstox real option chain) =====
 TARGET_PREMIUM = 95.0
