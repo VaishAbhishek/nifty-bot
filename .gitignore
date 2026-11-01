@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.tmp
+bot_state.json
+journal/
+backtest_*.csv
+paper_trades_old_*.csv
