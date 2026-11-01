@@ -1,167 +1,221 @@
 """
-Main loop for the Nifty paper trading bot.
-Now uses Upstox API for real NSE data:
-  - data_feed_upstox  : real 5-min Nifty candles (replaces yfinance)
-  - option_chain_upstox: real option chain LTP (replaces synthetic B-S)
+Main loop for the Nifty paper trading bot (Upstox data).
+
+Each cycle:
+  1. Monitor open positions FIRST (stops, trailing, targets, 15:15 force-close),
+     regardless of pauses or pending approvals.
+  2. Fetch candles, run the signal engine, log every signal with market context.
+  3. Every SNAPSHOT_EVERY_MINUTES, record a market context snapshot.
+  4. After the close, write the daily journal (and the weekly review on the
+     last trading day of the week) and send a Telegram summary.
 
 Run with: python3 main.py
 """
 
 import os
 import time
-import requests
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
 
 import config
 import data_feed_upstox as data_feed
-import signal_engine
+import journal
+import market_calendar
 import option_chain_upstox as option_chain
+import signal_engine
 import telegram_bot
-from paper_trader import PaperTrader
+import weekly_review
+from paper_trader import PaperTrader, premium_risk_points, structure_stop
 
 IST = ZoneInfo("Asia/Kolkata")
-MARKET_OPEN  = dtime(9, 15)
+MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
+
+ctx_builder = journal.ContextBuilder()
+_chain_cache = {"at": None, "stats": {}}
 
 
 def is_market_hours(now):
-    return MARKET_OPEN <= now.time() <= MARKET_CLOSE and now.weekday() < 5
+    return (market_calendar.is_trading_day(now.date())
+            and MARKET_OPEN <= now.time() <= MARKET_CLOSE)
 
 
 def is_force_close_time(now):
     return now.time() >= dtime(config.FORCE_CLOSE_HOUR, config.FORCE_CLOSE_MINUTE)
 
 
+# ── Market context ───────────────────────────────────────────────────────────
+
+def market_context(df, now, chain=None, refresh_chain=False):
+    """Context dict for the journal. Option-chain stats are cached ~10 min."""
+    if chain is None:
+        stale = (_chain_cache["at"] is None
+                 or (now - _chain_cache["at"]).total_seconds() > 600)
+        if refresh_chain or stale:
+            _chain_cache["stats"] = option_chain.get_chain_stats()
+            _chain_cache["at"] = now
+        chain = _chain_cache["stats"]
+    return ctx_builder.build(df, now, vix=data_feed.get_vix(), chain=chain)
+
+
+def _safe_context(df, now, **kw):
+    try:
+        return market_context(df, now, **kw)
+    except Exception as e:
+        print(f"[{now:%H:%M:%S}] context error: {e}")
+        return {}
+
+
+def _dir_str(direction):
+    return "CE" if direction == 1 else "PE"
+
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+
 def main():
     engine = signal_engine.SignalEngine(
-        min_angle_deg      = config.MIN_ANGLE_DEG,
-        angle_confirm_bars = config.ANGLE_CONFIRM_BARS,
-        retest_buffer_pct  = config.RETEST_BUFFER_PCT,
-        use_wick_for_retest= config.USE_WICK_FOR_RETEST,
-        max_wait_bars      = config.MAX_WAIT_BARS,
+        min_angle_deg=config.MIN_ANGLE_DEG,
+        angle_confirm_bars=config.ANGLE_CONFIRM_BARS,
+        retest_buffer_pct=config.RETEST_BUFFER_PCT,
+        use_wick_for_retest=config.USE_WICK_FOR_RETEST,
+        max_wait_bars=config.MAX_WAIT_BARS,
     )
     trader = PaperTrader()
+    _close_stale_positions(trader)
 
     telegram_bot.send_message(
-        f"🤖 Nifty bot started (Upstox data). "
-        f"PAPER_TRADING={config.PAPER_TRADING}, "
-        f"angle≥{config.MIN_ANGLE_DEG}°, RR={config.RISK_REWARD_RATIO}"
+        f"🤖 Nifty bot started. PAPER_TRADING={config.PAPER_TRADING}, "
+        f"angle≥{config.MIN_ANGLE_DEG}°, RR={config.RISK_REWARD_RATIO}, "
+        f"SL {config.SL_MIN_POINTS:.0f}-{config.SL_MAX_POINTS:.0f} pts, "
+        f"max {config.MAX_LOSSES_PER_DAY} losses/day, lot {config.LOT_SIZE}"
     )
 
-    last_seen_candle_time = None
+    last_seen_candle = None
+    last_day = None
+    last_snapshot = None
+    journal_done_day = None
+    df = None
 
     while True:
         now = datetime.now(IST)
+        today = now.date()
+
+        # ── After the close: daily journal (once per trading day) ─────────
+        if (market_calendar.is_trading_day(today) and journal_done_day != today
+                and now.time() >= dtime(config.JOURNAL_HOUR, config.JOURNAL_MINUTE)):
+            _write_journals(today)
+            journal_done_day = today
 
         if not is_market_hours(now):
-            print(f"[{now:%H:%M:%S}] Outside market hours, sleeping...")
             time.sleep(60)
             continue
 
-        if trader.is_paused(now.date()):
-            print(f"[{now:%H:%M:%S}] Paused after consecutive losses. Resumes tomorrow.")
-            time.sleep(60)
-            continue
-
-        # ── Daily state reset at market open ──────────────────────────
-        current_day = now.date()
-        if not hasattr(main, '_last_day') or main._last_day != current_day:
+        # ── Daily reset ──────────────────────────────────────────────────
+        if last_day != today:
             engine.reset_day()
-            main._last_day = current_day
-            print(f"[{now:%H:%M:%S}] New day {current_day} — engine state reset")
+            trader.new_day(today)
+            last_day = today
+            print(f"[{now:%H:%M:%S}] New day {today} — engine state reset")
 
-        # ── Fetch candles ──────────────────────────────────────────────
-        # get_recent_candles() now merges:
-        #   - historical 5-min (v2 1-min API resampled)
-        #   - today's live 5-min (v3 intraday endpoint, no polling needed)
+        # ── 1. Always monitor open positions first ───────────────────────
+        _monitor_all_positions(trader, now)
+
+        # ── 2. Candles ───────────────────────────────────────────────────
         try:
             df = data_feed.get_recent_candles()
         except Exception as e:
             print(f"[{now:%H:%M:%S}] Candle fetch failed: {e}")
-            time.sleep(config.POLL_SECONDS)
+            time.sleep(config.POSITION_POLL_SECONDS if not trader.is_flat() else config.POLL_SECONDS)
             continue
-
         df = signal_engine.compute_indicators(
-            df, config.FAST_EMA_LEN, config.SLOW_EMA_LEN, config.ATR_LEN
-        )
+            df, config.FAST_EMA_LEN, config.SLOW_EMA_LEN, config.ATR_LEN)
 
-        latest_candle_time = df.index[-1]
-        # Normalize to UTC microseconds for reliable equality comparison
-        # (avoids tz-aware vs naive drift causing duplicate processing)
-        latest_candle_utc = df.index[-1].tz_convert("UTC") if hasattr(df.index[-1], 'tz_convert') else df.index[-1]
+        # ── 3. Periodic market snapshot ──────────────────────────────────
+        if last_snapshot is None or (now - last_snapshot) >= timedelta(minutes=config.SNAPSHOT_EVERY_MINUTES):
+            journal.record_snapshot(now, _safe_context(df, now, refresh_chain=True))
+            last_snapshot = now
 
-        # ── Same candle still running — check intrabar retest & monitor ──
-        if latest_candle_utc == last_seen_candle_time:
+        latest = df.index[-1].tz_convert("UTC")
+
+        # ── Same candle still forming ────────────────────────────────────
+        if latest == last_seen_candle:
+            if engine.armed:
+                _check_ltp_retest(engine, df, trader, now)
+            elif trader.is_flat() and engine.pending_dir == 0:
+                _check_intrabar_crossover(df, now)
             if not trader.is_flat():
-                # Position open — check exits fast (SL/target can hit within seconds)
-                _monitor_all_positions(trader, now)
                 sleep_secs = config.POSITION_POLL_SECONDS
             elif engine.armed:
-                # Armed — real-time LTP-based retest: fires at the exact tick price touches EMA
-                _check_ltp_retest(engine, df, trader, now)
-                # After _check_ltp_retest, engine.armed may now be False (entry fired).
-                # Use fast poll if still armed, normal poll if entry fired or not armed.
-                sleep_secs = config.LTP_POLL_SECONDS if engine.armed else config.POLL_SECONDS
-            elif trader.is_flat() and not engine.armed and engine.pending_dir == 0:
-                # Not armed yet — check if a crossover is forming intrabar (informational only)
-                _check_intrabar_crossover(engine, df, now)
-                sleep_secs = config.POLL_SECONDS
+                sleep_secs = config.LTP_POLL_SECONDS
             else:
                 sleep_secs = config.POLL_SECONDS
             time.sleep(sleep_secs)
             continue
 
-        # ── New closed candle ──────────────────────────────────────────
-        last_seen_candle_time = latest_candle_utc
-        fast_ema_val = df["fast_ema"].iloc[-1]
-        slow_ema_val = df["slow_ema"].iloc[-1]
-        print(f"[{now:%H:%M:%S}] New candle: {latest_candle_time:%H:%M} "
-              f"close={df['close'].iloc[-1]:.2f} "
-              f"fast={fast_ema_val:.2f} slow={slow_ema_val:.2f}")
+        # ── New closed candle ────────────────────────────────────────────
+        last_seen_candle = latest
+        print(f"[{now:%H:%M:%S}] New candle {df.index[-1]:%H:%M} close={df['close'].iloc[-1]:.2f} "
+              f"fast={df['fast_ema'].iloc[-1]:.2f} slow={df['slow_ema'].iloc[-1]:.2f}")
 
-        events = engine.process(df, flat=True)   # flat=True: engine signals always; positions managed separately
-        for event in events:
-            _handle_event(event, trader, now)
+        for event in engine.process(df, flat=True):
+            _handle_event(event, trader, now, df)
 
-        # ── EOD: clear armed state at force-close time ───────────────────
         if is_force_close_time(now) and engine.armed:
-            print(f"[{now:%H:%M:%S}] EOD: armed {('CE' if engine.armed_dir == 1 else 'PE')} "
-                  f"setup cleared (force-close time — no retest occurred)")
+            journal.record_signal("invalidated", engine.armed_dir, now, "eod_force_close",
+                                  _safe_context(df, now))
             telegram_bot.send_message(
-                f"⏰ EOD: Armed {'CE' if engine.armed_dir == 1 else 'PE'} setup expired at force-close. No trade taken."
-            )
+                f"⏰ EOD: armed {_dir_str(engine.armed_dir)} setup expired at force-close.")
             engine.reset_day()
 
-        # Monitor ALL open positions (supports multiple simultaneous trades)
-        _monitor_all_positions(trader, now)
-
-        time.sleep(config.POLL_SECONDS)
+        time.sleep(config.POSITION_POLL_SECONDS if not trader.is_flat() else config.POLL_SECONDS)
 
 
+def _close_stale_positions(trader):
+    """Positions left over from a previous day (bot was down at 15:15)."""
+    now = datetime.now(IST)
+    for pos in list(trader.positions):
+        if datetime.fromisoformat(pos["entry_time"]).date() < now.date():
+            info = trader._close(pos, pos["last_price"], now, "STALE_RESTART")
+            telegram_bot.send_message(
+                f"⚠️ Closed stale paper position {info['strike']} {info['option_type']} "
+                f"from {info['date']} at last seen ₹{info['exit_premium']}.")
 
 
+def _write_journals(today):
+    try:
+        try:
+            df = data_feed.get_recent_candles()
+        except Exception:
+            df = None
+        summary = journal.write_daily(today, df)
+        print(summary)
+        telegram_bot.send_message(summary)
+        nxt = today + timedelta(days=1)
+        while not market_calendar.is_trading_day(nxt):
+            nxt += timedelta(days=1)
+        if nxt.isocalendar()[1] != today.isocalendar()[1]:
+            path = weekly_review.write_weekly(today)
+            telegram_bot.send_message(f"📊 Weekly review written: {path}")
+    except Exception as e:
+        print(f"Journal error: {e}")
+        telegram_bot.send_message(f"⚠️ Journal failed: {e}")
 
-# ── Intrabar early-warning crossover check ────────────────────────────────────
 
-_intrabar_warned_bar_ts = None   # module-level guard — warn once per live bar
+# ── Intrabar early-warning crossover check ──────────────────────────────────
 
-def _check_intrabar_crossover(engine, df, now):
-    """
-    Called every 30s during the current live bar (before it closes).
-    Appends the partial candle to df, recomputes EMAs, and checks if a
-    crossover is forming right now.
+_intrabar_warned_bar_ts = None
 
-    If yes: sends a Telegram early-warning (up to ~4.5 min before bar close).
-    This is purely informational — no trade fires until bar close + angle check.
-    Fires at most once per bar (guarded by _intrabar_warned_bar_ts).
-    """
+
+def _check_intrabar_crossover(df, now):
+    """Informational Telegram alert when a crossover is forming in the live bar."""
     global _intrabar_warned_bar_ts
     try:
         token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
         resp = requests.get(
-            "https://api.upstox.com/v3/historical-candle/intraday"
-            "/NSE_INDEX%7CNifty%2050/minutes/5",
+            "https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/5",
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
             timeout=10,
         )
@@ -170,229 +224,166 @@ def _check_intrabar_crossover(engine, df, now):
         candles = resp.json().get("data", {}).get("candles", [])
         if not candles:
             return
-
-        # Last candle is the current in-progress (partial) bar
-        live = candles[-1]   # [ts, open, high, low, close, vol, oi]
-        live_ts    = live[0]
-        live_close = float(live[4])
-
-        # Only warn once per live bar
-        if _intrabar_warned_bar_ts == live_ts:
+        live = max(candles, key=lambda c: c[0])
+        if _intrabar_warned_bar_ts == live[0]:
             return
-
-        # Append partial candle to df and recompute EMAs
-        import pandas as pd
-        live_index = pd.Timestamp(live_ts)
-        if live_index.tzinfo is None:
-            live_index = live_index.tz_localize("Asia/Kolkata")
-        else:
-            live_index = live_index.tz_convert("Asia/Kolkata")
-
-        live_row = pd.DataFrame(
-            {"open": [float(live[1])], "high": [float(live[2])],
-             "low": [float(live[3])], "close": [live_close]},
-            index=[live_index]
-        )
-        df_live = pd.concat([df, live_row])
-        df_live = signal_engine.compute_indicators(
-            df_live, config.FAST_EMA_LEN, config.SLOW_EMA_LEN, config.ATR_LEN
-        )
-
-        fast = df_live["fast_ema"]
-        slow = df_live["slow_ema"]
-        n = len(df_live) - 1
-
-        cross_up   = fast.iloc[n-1] < slow.iloc[n-1] and fast.iloc[n] > slow.iloc[n]
-        cross_down = fast.iloc[n-1] > slow.iloc[n-1] and fast.iloc[n] < slow.iloc[n]
-
-        if cross_up or cross_down:
-            _intrabar_warned_bar_ts = live_ts
-            direction = "Bullish (CE)" if cross_up else "Bearish (PE)"
-            fast_now  = fast.iloc[n]
-            slow_now  = slow.iloc[n]
-            # Compute minutes remaining in the current 5-min bar
-            bar_open = live_index.replace(second=0, microsecond=0)
-            elapsed_sec = max(0, (now - bar_open.replace(tzinfo=now.tzinfo)).total_seconds())
-            mins_left = max(0, 5 - int(elapsed_sec // 60))
-
-            msg = (
-                f"⚡ Early warning: {direction} crossover forming!\n"
-                f"Live price: {live_close:.2f}\n"
-                f"Fast EMA: {fast_now:.2f} | Slow EMA: {slow_now:.2f}\n"
-                f"~{mins_left} min until bar close — wait for angle confirmation."
-            )
-            print(f"[{now:%H:%M:%S}] ⚡ INTRABAR crossover developing: {direction} "
-                  f"live={live_close:.2f} fast={fast_now:.2f} slow={slow_now:.2f}")
-            telegram_bot.send_message(msg)
-
+        idx = pd.Timestamp(live[0])
+        idx = idx.tz_localize("Asia/Kolkata") if idx.tzinfo is None else idx.tz_convert("Asia/Kolkata")
+        if idx <= df.index[-1]:
+            return   # not a newer, in-progress bar
+        row = pd.DataFrame({"open": [float(live[1])], "high": [float(live[2])],
+                            "low": [float(live[3])], "close": [float(live[4])]}, index=[idx])
+        d = signal_engine.compute_indicators(pd.concat([df[["open", "high", "low", "close"]], row]),
+                                             config.FAST_EMA_LEN, config.SLOW_EMA_LEN, config.ATR_LEN)
+        f, s = d["fast_ema"], d["slow_ema"]
+        up = f.iloc[-2] < s.iloc[-2] and f.iloc[-1] > s.iloc[-1]
+        down = f.iloc[-2] > s.iloc[-2] and f.iloc[-1] < s.iloc[-1]
+        if up or down:
+            _intrabar_warned_bar_ts = live[0]
+            telegram_bot.send_message(
+                f"⚡ Early warning: {'Bullish (CE)' if up else 'Bearish (PE)'} crossover forming. "
+                f"Live {float(live[4]):.2f} — wait for bar close + angle check.")
     except Exception as e:
         print(f"[{now:%H:%M:%S}] Intrabar crossover check error: {e}")
 
 
 def _check_ltp_retest(engine, df, trader, now):
-    """
-    Real-time EMA touch detection using the Nifty 50 LTP (tick price).
-
-    Why this is better than reading the partial candle's high/low:
-    - The LTP endpoint reflects the *current* market price, not a bar aggregate.
-    - We fire the entry at the exact moment price touches the EMA, not at bar close.
-    - Fast EMA is fixed for the entire live bar (computed from closed candles only),
-      so we can compare LTP against it directly without recomputing anything.
-
-    Guard: requires at least 1 fully closed candle since arming — prevents entering
-    on the same candle that generated the crossover before price has moved away.
-    """
-    # Enforce minimum 1-bar wait after arming
+    """Fire the entry the moment the live Nifty price touches the fast EMA."""
     if engine.wait_start_ts is not None:
-        wait_pos = None
         try:
             wait_pos = df.index.get_loc(engine.wait_start_ts)
         except KeyError:
-            pass
-        bars_since_arm = (len(df) - 1 - wait_pos) if wait_pos is not None else 0
-        if bars_since_arm < 1:
-            return  # too soon — arm candle hasn't closed yet
-
-    try:
-        ltp = data_feed.get_nifty_ltp()
-        if ltp is None:
-            return
-
-        # EMA values are fixed for the current live bar — computed from closed candles
-        fast_ema = float(df["fast_ema"].iloc[-1])
-        slow_ema = float(df["slow_ema"].iloc[-1])
-        buffer   = fast_ema * config.RETEST_BUFFER_PCT / 100
-
-        retest = False
-        if engine.armed_dir == 1 and ltp <= fast_ema + buffer:
-            # Bullish setup: price pulled back down to touch the Fast EMA
-            retest = True
-        elif engine.armed_dir == -1 and ltp >= fast_ema - buffer:
-            # Bearish setup: price bounced up to touch the Fast EMA
-            retest = True
-
-        if retest:
-            direction = engine.armed_dir
-            print(
-                f"[{now:%H:%M:%S}] 🎯 LTP retest detected! "
-                f"LTP={ltp:.2f} fast_ema={fast_ema:.2f} "
-                f"({'bullish' if direction == 1 else 'bearish'})"
-            )
-            engine.armed         = False
-            engine.armed_dir     = 0
-            engine.wait_start_ts = None
-            # Entry price = actual LTP at touch (not candle close)
-            _handle_event(("entry", direction, ltp, slow_ema), trader, now)
-
-    except Exception as e:
-        print(f"[{now:%H:%M:%S}] LTP retest check error: {e}")
+            wait_pos = None
+        if wait_pos is None or (len(df) - 1 - wait_pos) < 1:
+            return   # arm candle hasn't been followed by a closed candle yet
+    ltp = data_feed.get_nifty_ltp()
+    if ltp is None:
+        return
+    fast_ema = float(df["fast_ema"].iloc[-1])
+    slow_ema = float(df["slow_ema"].iloc[-1])
+    buffer = fast_ema * config.RETEST_BUFFER_PCT / 100
+    direction = engine.armed_dir
+    if (direction == 1 and ltp <= fast_ema + buffer) or (direction == -1 and ltp >= fast_ema - buffer):
+        print(f"[{now:%H:%M:%S}] 🎯 LTP retest: LTP={ltp:.2f} fast={fast_ema:.2f} ({_dir_str(direction)})")
+        engine.armed, engine.armed_dir, engine.wait_start_ts = False, 0, None
+        _process_entry(direction, float(ltp), slow_ema, trader, now, df, source="ltp_touch")
 
 
-# ── Event handler ──────────────────────────────────────────────────────────
+# ── Events ───────────────────────────────────────────────────────────────────
 
-def _handle_event(event, trader, now):
+def _handle_event(event, trader, now, df):
     kind = event[0]
 
     if kind == "angle_check":
-        # angle_check tuple: (kind, direction, angle_deg, passed, ema_reversed)
-        _, direction, angle_deg, passed = event[0], event[1], event[2], event[3]
-        ema_reversed = event[4] if len(event) > 4 else False
-        dir_str = "Bullish" if direction == 1 else "Bearish"
-        status  = "PASSED ✅" if passed else "rejected"
-        reversal_note = " (EMA reversed after cross — choppy)" if ema_reversed and not passed else ""
-        print(f"[{now:%H:%M:%S}] {dir_str} crossover, angle={angle_deg:.1f}°, {status}{reversal_note}")
+        _, direction, angle, passed = event[:4]
+        reversed_ = event[4] if len(event) > 4 else False
+        detail = f"angle {angle:.1f}°" + (" (EMA reversed)" if reversed_ and not passed else "")
+        print(f"[{now:%H:%M:%S}] {_dir_str(direction)} crossover {detail} "
+              f"{'PASSED' if passed else 'rejected'}")
+        journal.record_signal("angle_pass" if passed else "angle_fail", direction, now, detail,
+                              _safe_context(df, now))
 
     elif kind == "armed":
-        _, direction = event
-        dir_str = "Bullish (CE)" if direction == 1 else "Bearish (PE)"
-        print(f"[{now:%H:%M:%S}] Armed: {dir_str}, waiting for retest")
-        telegram_bot.send_message(
-            f"👀 {dir_str} setup armed — waiting for retest near Fast EMA."
-        )
+        direction = event[1]
+        journal.record_signal("armed", direction, now, "waiting for fast-EMA retest",
+                              _safe_context(df, now))
+        telegram_bot.send_message(f"👀 {_dir_str(direction)} setup armed — waiting for retest.")
 
     elif kind == "invalidated":
-        _, reason = event
-        print(f"[{now:%H:%M:%S}] Setup invalidated: {reason}")
+        journal.record_signal("invalidated", 0, now, event[1], _safe_context(df, now))
 
     elif kind == "skipped_gap":
-        print(f"[{now:%H:%M:%S}] Crossover skipped — gap candle")
+        journal.record_signal("skipped_gap", event[1], now, "first candle gapped", {})
 
     elif kind == "skipped_crossover":
-        _, direction, reason = event
-        dir_str = "Bullish (CE)" if direction == 1 else "Bearish (PE)"
-        reason_map = {
-            "already_armed":  "a setup is already armed",
-            "pending_exists": "waiting on earlier crossover angle",
-        }
-        reason_str = reason_map.get(reason, reason)
-        print(f"[{now:%H:%M:%S}] {dir_str} crossover SKIPPED — {reason_str}")
-
+        journal.record_signal("skipped_crossover", event[1], now, event[2], {})
 
     elif kind == "entry":
-        _, direction, underlying_entry, underlying_sl = event
-        _process_entry(direction, underlying_entry, underlying_sl, trader, now)
+        _, direction, underlying_entry, slow_ema = event
+        _process_entry(direction, underlying_entry, slow_ema, trader, now, df, source="candle_close")
 
 
-def _process_entry(direction, underlying_entry, underlying_sl, trader, now):
+def _process_entry(direction, underlying_entry, slow_ema, trader, now, df, source):
     dir_str = "CE (Buy Call)" if direction == 1 else "PE (Buy Put)"
 
+    ok, reason = trader.can_open()
+    if ok and is_force_close_time(now):
+        ok, reason = False, "after_force_close_time"
+    if not ok:
+        journal.record_signal("entry_skipped", direction, now, reason, _safe_context(df, now))
+        print(f"[{now:%H:%M:%S}] Entry signal {dir_str} skipped: {reason}")
+        if reason != "position_open":
+            telegram_bot.send_message(f"⏸ {dir_str} signal skipped — {reason}.")
+        return
+
     try:
-        strike_info = option_chain.find_strike_near_premium(
-            direction, config.TARGET_PREMIUM
-        )
+        strike = option_chain.find_strike_near_premium(direction, config.TARGET_PREMIUM)
     except Exception as e:
-        msg = f"⚠️ Entry signal ({dir_str}) — option chain fetch failed: {e}"
-        print(f"[{now:%H:%M:%S}] {msg}")
-        telegram_bot.send_message(msg)
+        journal.record_signal("entry_skipped", direction, now, f"strike: {e}", _safe_context(df, now))
+        telegram_bot.send_message(f"⚠️ {dir_str} signal — no trade: {e}")
         return
 
-    bid_ask = ""
-    if strike_info.get("bid") and strike_info.get("ask"):
-        bid_ask = f"\nBid/Ask: ₹{strike_info['bid']} / ₹{strike_info['ask']}"
+    chain = dict(strike.get("chain_stats") or {}, expiry=strike.get("expiry"))
+    ctx = _safe_context(df, now, chain=chain)
+    signal_id = journal.record_signal(
+        "entry_signal", direction, now,
+        f"{source}; Nifty {underlying_entry:.2f}; {strike['strike']} {strike['option_type']} "
+        f"@{strike['premium']} spread {strike['spread_pct']}%", ctx)
 
-    msg = (
-        f"📍 Entry signal: {dir_str}\n"
-        f"Strike: {strike_info['strike']} {strike_info['option_type']}\n"
-        f"Premium (LTP): ₹{strike_info['premium']}{bid_ask}\n"
-        f"Expiry: {strike_info['expiry']}\n"
-        f"(Paper trade — approve or auto-executes in {config.APPROVAL_TIMEOUT_SECONDS}s)"
-    )
-    approved = telegram_bot.request_approval(msg)
-
+    u_stop = structure_stop(direction, df, slow_ema)
+    risk, raw = premium_risk_points(direction, underlying_entry, u_stop, strike.get("delta"))
+    msg = (f"📍 Entry signal: {dir_str}\n"
+           f"Strike: {strike['strike']} {strike['option_type']} (exp {strike['expiry']})\n"
+           f"Premium ₹{strike['premium']} | Bid/Ask ₹{strike['bid']}/₹{strike['ask']} "
+           f"({strike['spread_pct']}%)\n"
+           f"Delta {strike.get('delta')} | Stop {risk} pts (structure {raw}) | Target {risk * config.RISK_REWARD_RATIO:.1f} pts\n"
+           f"(Paper trade — approve or auto-executes in {config.APPROVAL_TIMEOUT_SECONDS}s)")
+    approved = telegram_bot.request_approval(
+        msg, on_tick=lambda: _monitor_all_positions(trader, datetime.now(IST)))
     if not approved:
-        print(f"[{now:%H:%M:%S}] Entry rejected via Telegram")
+        journal.record_signal("entry_rejected", direction, now, "rejected via Telegram", ctx)
         return
 
-    position = trader.open_position(
-        direction, strike_info, underlying_entry,
-        underlying_sl, config.RISK_REWARD_RATIO, now
-    )
+    # Fresh quote at the moment of entry — the chain price may be a minute old
+    quote = option_chain.get_option_quote(strike["instrument_key"]) or {
+        "bid": strike["bid"], "ask": strike["ask"], "ltp": strike["premium"]}
+    bid, ask = quote.get("bid") or 0, quote.get("ask") or 0
+    if bid and ask and (ask - bid) / ((ask + bid) / 2) * 100 > config.MAX_SPREAD_PCT:
+        journal.record_signal("entry_skipped", direction, now,
+                              f"spread widened to {bid}/{ask} before fill", ctx)
+        telegram_bot.send_message(f"⏸ {dir_str} skipped — spread widened ({bid}/{ask}).")
+        return
+
+    entry_now = datetime.now(IST)
+    pos = trader.open_position(direction, strike, quote, underlying_entry, u_stop,
+                               entry_now, context=ctx, signal_id=signal_id)
+    journal.record_signal("trade_open", direction, entry_now,
+                          f"{pos['strike']} {pos['option_type']} fill ₹{pos['entry_fill']} "
+                          f"SL ₹{pos['sl_premium']} TGT ₹{pos['target_premium']}", ctx)
     telegram_bot.send_message(
-        f"✅ PAPER trade opened:\n"
-        f"{strike_info['strike']} {strike_info['option_type']} @ ₹{strike_info['premium']}\n"
-        f"SL: ₹{position['sl_premium']:.2f} | Target: ₹{position['target_premium']:.2f}"
-    )
+        f"✅ PAPER trade opened: {pos['strike']} {pos['option_type']} @ ₹{pos['entry_fill']} (ask)\n"
+        f"SL ₹{pos['sl_premium']} ({pos['risk_points']} pts) | Target ₹{pos['target_premium']}\n"
+        f"Trailing: BE at +1R, +0.5R locked at +1.5R")
 
 
 def _monitor_all_positions(trader, now):
-    """Monitor ALL open positions and handle exits. Supports multiple simultaneous trades."""
     if trader.is_flat():
         return
-
-    force_close = is_force_close_time(now)
-    count = len(trader.positions)
-    if count > 1:
-        print(f"[{now:%H:%M:%S}] Monitoring {count} open positions")
-
-    closed = trader.check_all_exits(option_chain.get_option_ltp, now, force_close=force_close)
-    for exit_info in closed:
-        emoji = "🟢" if exit_info["result"] == "WIN" else "🔴"
+    closed = trader.check_all_exits(option_chain.get_option_quote, now,
+                                    force_close=is_force_close_time(now))
+    for x in closed:
+        emoji = {"WIN": "🟢", "LOSS": "🔴"}.get(x["result"], "⚪")
+        journal.record_signal("trade_exit", x["direction"], now,
+                              f"{x['exit_reason']} @ ₹{x['exit_premium']} net ₹{x['net_pnl']}", {})
         telegram_bot.send_message(
-            f"{emoji} PAPER trade closed: {exit_info['result']} ({exit_info['exit_reason']})\n"
-            f"{exit_info['strike']} {exit_info['option_type']}: "
-            f"₹{exit_info['entry_premium']} → ₹{exit_info['exit_premium']}\n"
-            f"P&L per lot: ₹{exit_info['pnl_per_lot']:,.2f}"
-        )
+            f"{emoji} PAPER trade closed: {x['result']} ({x['exit_reason']})\n"
+            f"{x['strike']} {x['option_type']}: ₹{x['entry_fill']} → ₹{x['exit_premium']} "
+            f"in {x['minutes_held']} min\n"
+            f"Gross ₹{x['gross_pnl']:,.0f} − costs ₹{x['charges']:,.0f} = net ₹{x['net_pnl']:,.0f}")
+    if closed and trader.is_paused():
+        telegram_bot.send_message(
+            f"🛑 Daily limit reached ({trader.losses_today} losses, ₹{trader.pnl_today:,.0f}). "
+            f"No new trades today; still monitoring.")
 
 
 if __name__ == "__main__":

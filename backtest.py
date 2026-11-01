@@ -29,6 +29,9 @@ import numpy as np
 import pandas as pd
 import requests
 
+import config
+import costs
+
 warnings.filterwarnings("ignore")
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -51,7 +54,7 @@ USE_WICK          = True
 DELTA             = 0.45    # approximate ATM option delta for P&L scaling
 FORCE_CLOSE_HOUR  = 15
 FORCE_CLOSE_MIN   = 15
-MAX_CONSEC_LOSSES = 2       # pause after N consecutive losses (mirrors live bot)
+MAX_CONSEC_LOSSES = config.MAX_LOSSES_PER_DAY  # pause for the day after N losses (mirrors live bot)
 
 LOOKBACK_MONTHS   = 6       # how many months of history to fetch
 ENCODED_KEY       = "NSE_INDEX%7CNifty%2050"
@@ -278,7 +281,11 @@ def run_backtest(df, params):
             if closed:
                 # P&L on underlying (DELTA-scaled to approximate option premium move)
                 raw_pnl = (exit_px - entry_price) * trade_dir
-                opt_pnl = raw_pnl * DELTA
+                # ₹ per lot, net of charges (entry premium assumed = TARGET_PREMIUM).
+                # Still a delta approximation: no theta/IV — treat as optimistic.
+                prem_move = raw_pnl * DELTA
+                opt_pnl = prem_move * config.LOT_SIZE - costs.round_trip_charges(
+                    config.TARGET_PREMIUM, max(config.TARGET_PREMIUM + prem_move, 0.05))
                 trades.append({
                     "entry_time":  df.index[i - 1],   # approximate — retest bar
                     "exit_time":   ts,

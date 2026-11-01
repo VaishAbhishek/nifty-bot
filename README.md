@@ -1,70 +1,56 @@
 # Nifty EMA Crossover + Angle + Retest — Paper Trading Bot
 
-A Python port of the TradingView Pine Script strategy, running fully free using
-yfinance (underlying data) and NSE's public option chain (premiums), with
-Telegram approval notifications. PAPER TRADING ONLY by default.
+Python port of the TradingView Pine Script strategy. Uses Upstox (analytics
+token) for Nifty candles, India VIX and the real option chain, with Telegram
+notifications/approvals. **PAPER TRADING ONLY.**
 
-## Important limitations to know going in
+## How a trade works
 
-- **yfinance data has no SLA** — it's free and generally reliable for Indian
-  indices, but can lag or occasionally drop a candle. Don't treat it as
-  exchange-grade for real-money decisions later.
-- **NSE's option chain endpoint is unofficial** — it can rate-limit, block, or
-  change format without notice. If `option_chain.py` starts failing, that's
-  the most likely cause — check NSE hasn't changed their site.
-- **This has NOT been run against live data yet** — I built it from the same
-  logic as your validated Pine Script, but I can't execute it myself (no
-  network access to these services from where I work). Please run a few days
-  of paper trading and compare the trade log against what you'd expect from
-  the Pine backtest before trusting it.
-- **Run this on a machine that stays on during market hours** — your laptop
-  sleeping or closing will stop the bot. A cheap always-on VPS is the
-  eventual answer; for the 2-week paper test, anything that stays awake works.
+1. EMA 9/15 crossover on 5-min Nifty → angle check 2 bars later (≥ 7°, ATR-normalised).
+2. Armed: wait up to 15 bars for price to touch the fast EMA (live LTP).
+3. Strike: the **liquid** CE/PE (spread ≤ `MAX_SPREAD_PCT`) with premium nearest ₹95, nearest expiry
+   (holiday shifts handled).
+4. Fill at the **ask** using a fresh quote taken after Telegram approval (auto-approves after 60s).
+5. Stop: beyond the recent swing low/high and slow EMA, converted with the option's real delta,
+   clamped to **10–15 premium points**. Target = 2R.
+6. Trailing: at +1R the stop moves to breakeven + costs; at +1.5R it locks +0.5R.
+7. Exits are taken at the **bid**, minus charges (`costs.py`). Force-close at 15:15.
+
+## Risk rules
+- One open position at a time.
+- No new trades after **2 losing trades** or **₹2,100 net loss** in a day (positions still monitored).
+- Open positions and daily counters are saved to `bot_state.json`, so restarts lose nothing.
+
+## Daily journal
+Written at 15:40 into `journal/` and summarised on Telegram:
+- `journal/YYYY-MM-DD.md` — market summary (gap, day type, VIX, PCR, OI walls, events), every trade
+  with a rule-based "Why" list, the full signal timeline, and a **My notes** section that is kept
+  when the page is regenerated.
+- `journal/signals.csv` — every signal (passed, rejected, skipped, entered) with market context.
+- `journal/market_snapshots.csv` — context every 15 minutes.
+- `paper_trades.csv` — every closed trade with entry context, MFE/MAE, gross, costs, net.
+- `journal/weekly-YYYY-MM-DD.md` — after the last trading day of each week: results grouped by
+  entry time, weekday, VIX band, trend alignment, expiry distance and more.
+  Run by hand: `python3 weekly_review.py --all`
+
+Add scheduled events (RBI, Fed, Budget, CPI) to `events.csv`; trades on those days are tagged.
+Add exchange holidays to `NSE_HOLIDAYS` in `config.py`.
 
 ## Setup
-
-1. Install Python 3.10+ if you don't have it.
-2. Install dependencies:
+1. Python 3.10+, then `pip install -r requirements.txt`
+2. `~/.nifty_bot_env` (plain `KEY=VALUE`, no `export`, for systemd):
    ```
-   pip install -r requirements.txt
+   UPSTOX_ANALYTICS_TOKEN=...
+   TELEGRAM_BOT_TOKEN=...
+   TELEGRAM_CHAT_ID=...
    ```
-3. Set up Telegram notifications (optional but recommended):
-   - Open Telegram, search for **@BotFather**, send `/newbot`, follow the
-     prompts. It gives you a **bot token** — copy it.
-   - Send any message to your new bot (search for it by the username you gave it).
-   - Visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser
-     — find `"chat":{"id":...}` in the response, that number is your **chat ID**.
-   - Set these as environment variables before running:
-     ```
-     export TELEGRAM_BOT_TOKEN="your_token_here"
-     export TELEGRAM_CHAT_ID="your_chat_id_here"
-     ```
-     (On Windows, use `set` instead of `export`, or add them in PowerShell with `$env:`.)
-   - If you skip this, the bot still runs and auto-approves every trade — it
-     just won't notify you.
+3. `python3 main.py` (or the `nifty_bot` systemd service)
 
-## Running
-
-```
-python main.py
-```
-
-It will run continuously during market hours (9:15 AM–3:30 PM IST,
-weekdays), checking for new candles every 30 seconds. Leave it running.
-
-## Output
-
-Every paper trade (win, loss, or EOD close) is logged to `paper_trades.csv`
-in this folder — review this after your 2-week test to see win rate, average
-P&L, and how often the strategy actually fired.
-
-## Known simplifications in this v1 (worth knowing)
-
-- **SL/target premium distance is approximated** using the same point
-  distance as the underlying's SL/target, not scaled by option delta. Real
-  option premium moves aren't 1:1 with the underlying, so simulated P&L will
-  be directionally right but not exact. We can refine this with proper
-  delta-based estimation once the core logic is validated.
-- **No historical parity test included yet** — recommend running this and
-  comparing entries against the same dates in your TradingView Strategy
-  Tester to catch any logic drift between the Pine and Python versions.
+## Known limits
+- Backtests still approximate option P&L with a fixed delta (no theta/IV); treat them as optimistic.
+  Real option-candle backtesting needs Upstox's expired-instrument data (Plus plan).
+- Charges in `config.py` are estimates — check them against a real contract note.
+- News and FII/DII flows aren't captured automatically (NSE blocks cloud IPs); use the
+  **My notes** section of each day's journal.
+- `data_feed.py`, `option_chain.py`, `option_chain_synth.py` are legacy (yfinance/NSE/synthetic)
+  and not used by `main.py`.

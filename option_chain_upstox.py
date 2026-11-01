@@ -1,17 +1,23 @@
 """
 Real Nifty weekly option chain via Upstox API v2.
-Replaces the Black-Scholes synthetic estimate entirely.
-Returns actual LTP (Last Traded Price) from NSE — the real premium
-you'd pay if you placed a market order right now.
 
-Uses Analytics Token — no daily refresh needed.
+- find_strike_near_premium(): picks the strike nearest the target premium among
+  LIQUID strikes (tight bid-ask, optional OI floor) and returns its delta, IV,
+  OI, bid/ask plus chain-wide sentiment stats (PCR, max-OI strikes).
+- get_option_quote(): live bid / ask / LTP for an open position.
+- get_chain_stats(): sentiment snapshot for the journal.
+
+Uses the Analytics Token — read-only, no daily refresh needed.
 """
 
-import requests
-import os
 import datetime
+import os
 from zoneinfo import ZoneInfo
+
+import requests
+
 import config
+import market_calendar
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://api.upstox.com/v2"
@@ -22,113 +28,74 @@ def _headers():
     token = os.environ.get("UPSTOX_ANALYTICS_TOKEN", "")
     if not token:
         raise RuntimeError("UPSTOX_ANALYTICS_TOKEN not set in environment")
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _today():
+    return datetime.datetime.now(IST).date()
+
+
+# ── Expiry discovery ─────────────────────────────────────────────────────────
+
+_expiry_cache = {"day": None, "expiry": None}
 
 
 def _try_expiry_candidates():
     """
-    Generate candidate expiry dates to try, in chronological order.
-    Covers today through the next 14 calendar days.
-    NSE weekly expiry is normally Tuesday; on holidays it shifts to Monday
-    (or occasionally Wednesday). Rather than maintaining a holiday calendar,
-    we probe dates and take the first one with live LTP data.
+    Candidate expiry dates in order: the calendar-based expected expiry first,
+    then every trading day over the next 14 days (covers unexpected shifts).
     """
-    today = datetime.date.today()
-    # Weekdays only (Mon-Fri) from today through next 14 days
-    candidates = []
+    today = _today()
+    expected = market_calendar.weekly_expiry_for(today).strftime("%Y-%m-%d")
+    candidates = [expected]
     for offset in range(15):
         d = today + datetime.timedelta(days=offset)
-        if d.weekday() < 5:   # Mon=0 ... Fri=4
-            candidates.append(d.strftime("%Y-%m-%d"))
+        s = d.strftime("%Y-%m-%d")
+        if market_calendar.is_trading_day(d) and s not in candidates:
+            candidates.append(s)
     return candidates
 
 
-def discover_nearest_expiry(direction=1):
-    """
-    Finds the nearest Nifty weekly expiry that actually has live LTP data.
+def _chain_has_live_data(data):
+    for row in data.get("data", []) or []:
+        for side_key in ("call_options", "put_options"):
+            side = row.get(side_key) or {}
+            if (side.get("market_data") or {}).get("ltp", 0) > 0:
+                return True
+    return False
 
-    Handles all cases automatically:
-      - Normal Tuesday expiry
-      - Holiday shift to Monday
-      - Holiday shift to Wednesday
-      - Weekend / after-hours (returns None if market is fully closed)
 
-    Returns (expiry_date_str, candidates_list) or raises RuntimeError.
-    """
-    side_key = "call_options" if direction == 1 else "put_options"
-
+def discover_nearest_expiry():
+    """Nearest expiry with live data. Cached for the day once found."""
+    today = _today()
+    if _expiry_cache["day"] == today and _expiry_cache["expiry"]:
+        return _expiry_cache["expiry"]
     for expiry_date in _try_expiry_candidates():
         try:
             data = fetch_option_chain(expiry_date)
         except Exception:
             continue
-
-        # Check if this expiry has any strikes with real LTP
-        for row in data.get("data", []):
-            side = row.get(side_key, {})
-            if side and side.get("market_data", {}).get("ltp", 0) > 0:
-                return expiry_date   # found a live expiry
-
-    raise RuntimeError(
-        "Could not find any Nifty weekly expiry with live LTP data. "
-        "Market is likely closed or Upstox data is unavailable."
-    )
+        if _chain_has_live_data(data):
+            _expiry_cache.update(day=today, expiry=expiry_date)
+            return expiry_date
+    raise RuntimeError("Could not find any Nifty expiry with live data.")
 
 
 def get_current_week_expiry():
-    """
-    Returns the nearest upcoming expiry as a 'YYYY-MM-DD' string.
-    Now a thin wrapper around discover_nearest_expiry() so holiday
-    shifts (e.g. Tuesday holiday → Monday expiry) are handled automatically.
-    Falls back to static Tuesday calculation when market is closed
-    (e.g. weekends) since discover_nearest_expiry needs live data.
-    """
-    today   = datetime.date.today()
-    now_ist = datetime.datetime.now(IST)
-    market_open = datetime.time(9, 15)
-    market_close = datetime.time(15, 30)
-    is_market_hours = (
-        today.weekday() < 5 and
-        market_open <= now_ist.time() <= market_close
-    )
-
-    if is_market_hours:
-        try:
-            return discover_nearest_expiry()
-        except Exception:
-            pass  # fall through to static calculation
-
-    # Static fallback: nearest Tuesday (used on weekends / after-hours)
-    days_to_tuesday = (1 - today.weekday()) % 7
-    if days_to_tuesday == 0 and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 30)):
-        days_to_tuesday = 7
-    expiry = today + datetime.timedelta(days=days_to_tuesday)
-    return expiry.strftime("%Y-%m-%d")
-
-
-def get_next_week_expiry():
-    """Returns the Tuesday 7 days after get_current_week_expiry()."""
-    curr = datetime.datetime.strptime(get_current_week_expiry(), "%Y-%m-%d").date()
-    return (curr + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+    """Nearest live expiry; falls back to the holiday-aware calendar rule."""
+    try:
+        return discover_nearest_expiry()
+    except Exception:
+        return market_calendar.weekly_expiry_for(_today()).strftime("%Y-%m-%d")
 
 
 def fetch_option_chain(expiry_date=None):
-    """
-    Fetch full Nifty option chain from Upstox for the given expiry.
-    Returns raw Upstox JSON response.
-    """
+    """Raw Upstox option chain JSON for the given expiry."""
     if expiry_date is None:
         expiry_date = get_current_week_expiry()
-
     resp = requests.get(
         f"{BASE_URL}/option/chain",
-        params={
-            "instrument_key": NIFTY_INSTRUMENT_KEY,
-            "expiry_date": expiry_date,
-        },
+        params={"instrument_key": NIFTY_INSTRUMENT_KEY, "expiry_date": expiry_date},
         headers=_headers(),
         timeout=15,
     )
@@ -136,71 +103,177 @@ def fetch_option_chain(expiry_date=None):
     return resp.json()
 
 
+# ── Chain statistics (sentiment for the journal) ─────────────────────────────
+
+def chain_stats(data):
+    """
+    PCR, highest call / put OI strikes and ATM IV from a raw chain response.
+    Highest call OI strike above spot is often read as resistance, highest put
+    OI strike below spot as support.
+    """
+    rows = data.get("data", []) or []
+    if not rows:
+        return {}
+    spot = None
+    total_call_oi = total_put_oi = 0.0
+    max_call = (None, -1.0)
+    max_put = (None, -1.0)
+    atm_row, atm_dist = None, None
+    for row in rows:
+        strike = row.get("strike_price")
+        spot = spot or row.get("underlying_spot_price")
+        c = (row.get("call_options") or {}).get("market_data") or {}
+        p = (row.get("put_options") or {}).get("market_data") or {}
+        c_oi, p_oi = float(c.get("oi") or 0), float(p.get("oi") or 0)
+        total_call_oi += c_oi
+        total_put_oi += p_oi
+        if c_oi > max_call[1]:
+            max_call = (strike, c_oi)
+        if p_oi > max_put[1]:
+            max_put = (strike, p_oi)
+        if spot and strike is not None:
+            dist = abs(strike - spot)
+            if atm_dist is None or dist < atm_dist:
+                atm_row, atm_dist = row, dist
+
+    atm_iv = None
+    if atm_row:
+        ivs = [((atm_row.get(k) or {}).get("option_greeks") or {}).get("iv")
+               for k in ("call_options", "put_options")]
+        ivs = [float(v) for v in ivs if v]
+        atm_iv = round(sum(ivs) / len(ivs), 2) if ivs else None
+
+    return {
+        "spot": spot,
+        "pcr": round(total_put_oi / total_call_oi, 3) if total_call_oi else None,
+        "max_call_oi_strike": max_call[0],
+        "max_put_oi_strike": max_put[0],
+        "atm_iv": atm_iv,
+    }
+
+
+def get_chain_stats():
+    """Sentiment snapshot for the nearest expiry (empty dict on failure)."""
+    try:
+        data = fetch_option_chain(get_current_week_expiry())
+        stats = chain_stats(data)
+        stats["expiry"] = get_current_week_expiry()
+        return stats
+    except Exception as e:
+        print(f"[option_chain] stats unavailable: {e}")
+        return {}
+
+
+# ── Strike selection ─────────────────────────────────────────────────────────
+
+def _spread_pct(bid, ask):
+    if not bid or not ask or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2
+    return round((ask - bid) / mid * 100, 2)
+
+
 def find_strike_near_premium(direction, target_premium=None):
     """
-    Find the CE or PE strike whose current LTP is closest to target_premium.
+    Pick the liquid CE (direction=1) or PE (direction=-1) strike whose premium is
+    closest to target_premium.
 
-    direction: 1 = bullish (buy CE), -1 = bearish (buy PE)
-    target_premium: defaults to config.TARGET_PREMIUM
-
-    Dynamically discovers the actual expiry date that has live LTP data —
-    handles Tuesday holidays (Monday expiry), Wednesday shifts, etc.
-
-    Returns dict:
-        strike, premium (real LTP), option_type, expiry,
-        instrument_key (for live LTP tracking after entry)
+    Liquid = two-sided quote with spread <= MAX_SPREAD_PCT and OI >= MIN_STRIKE_OI.
+    Returns a dict with strike, premium (LTP), bid, ask, spread_pct, delta, iv, oi,
+    option_type, expiry, instrument_key and chain_stats.
+    Raises RuntimeError("no liquid strike ...") if nothing qualifies.
     """
     if target_premium is None:
         target_premium = config.TARGET_PREMIUM
-
     option_type = "CE" if direction == 1 else "PE"
-    side_key    = "call_options" if direction == 1 else "put_options"
+    side_key = "call_options" if direction == 1 else "put_options"
 
-    # Try expiry dates dynamically: Mon/Tue/Wed of current + next week
-    for expiry_date in _try_expiry_candidates():
-        try:
-            data = fetch_option_chain(expiry_date)
-        except Exception:
+    expiry_date = get_current_week_expiry()
+    data = fetch_option_chain(expiry_date)
+    if not _chain_has_live_data(data):
+        raise RuntimeError(f"No live option data for expiry {expiry_date}")
+
+    liquid, illiquid = [], 0
+    for row in data.get("data", []) or []:
+        side = row.get(side_key)
+        if not side:
             continue
+        md = side.get("market_data") or {}
+        greeks = side.get("option_greeks") or {}
+        ltp = float(md.get("ltp") or 0)
+        if ltp <= 0:
+            continue
+        bid, ask = float(md.get("bid_price") or 0), float(md.get("ask_price") or 0)
+        spread = _spread_pct(bid, ask)
+        oi = float(md.get("oi") or 0)
+        if spread is None or spread > config.MAX_SPREAD_PCT or oi < config.MIN_STRIKE_OI:
+            illiquid += 1
+            continue
+        liquid.append({
+            "strike": row.get("strike_price"),
+            "premium": round(ltp, 2),
+            "bid": bid,
+            "ask": ask,
+            "spread_pct": spread,
+            "delta": abs(float(greeks["delta"])) if greeks.get("delta") else None,
+            "iv": float(greeks["iv"]) if greeks.get("iv") else None,
+            "oi": oi,
+            "option_type": option_type,
+            "expiry": expiry_date,
+            "instrument_key": side.get("instrument_key", ""),
+        })
 
-        candidates = []
-        for row in data.get("data", []):
-            side = row.get(side_key)
-            if not side:
-                continue
-            market_data = side.get("market_data", {})
-            ltp = market_data.get("ltp", 0)
-            if not ltp or ltp <= 0:
-                continue
-            candidates.append({
-                "strike":         row.get("strike_price"),
-                "premium":        round(float(ltp), 2),
-                "option_type":    option_type,
-                "expiry":         expiry_date,
-                "instrument_key": side.get("instrument_key", ""),
-                "bid":            market_data.get("bid_price", 0),
-                "ask":            market_data.get("ask_price", 0),
-            })
-
-        if candidates:
-            best = min(candidates, key=lambda c: abs(c["premium"] - target_premium))
-            return best
-
-    raise RuntimeError(
-        f"No valid {option_type} strikes with LTP > 0 found in the next 14 days. "
-        f"Market is likely closed or Upstox data is unavailable."
-    )
+    if not liquid:
+        raise RuntimeError(
+            f"no liquid strike: {illiquid} {option_type} strikes failed the "
+            f"spread/OI filter (max spread {config.MAX_SPREAD_PCT}%)"
+        )
+    best = min(liquid, key=lambda c: abs(c["premium"] - target_premium))
+    best["chain_stats"] = chain_stats(data)
+    return best
 
 
-def get_option_ltp(instrument_key):
+# ── Live quotes for open positions ───────────────────────────────────────────
+
+def get_option_quote(instrument_key):
     """
-    Fetch current LTP for an open option position.
-    Called every 30s by position monitor after entry.
-    instrument_key: Upstox key returned by find_strike_near_premium()
+    Live quote for an option: {"bid", "ask", "ltp", "oi"}.
+    Uses the full market quote (with depth); falls back to LTP-only.
+    Returns None if nothing could be fetched.
     """
     if not instrument_key:
         return None
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/market-quote/quotes",
+            params={"instrument_key": instrument_key},
+            headers=_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", {}) or {}
+        if data:
+            q = next(iter(data.values()))
+            depth = q.get("depth") or {}
+            buys, sells = depth.get("buy") or [], depth.get("sell") or []
+            bid = float(buys[0].get("price") or 0) if buys else 0.0
+            ask = float(sells[0].get("price") or 0) if sells else 0.0
+            ltp = float(q.get("last_price") or 0)
+            if ltp > 0 or bid > 0:
+                return {"bid": bid, "ask": ask, "ltp": ltp, "oi": q.get("oi")}
+    except Exception as e:
+        print(f"[option_chain] full quote failed, falling back to LTP: {e}")
 
+    ltp = get_option_ltp(instrument_key)
+    if ltp:
+        return {"bid": 0.0, "ask": 0.0, "ltp": float(ltp), "oi": None}
+    return None
+
+
+def get_option_ltp(instrument_key):
+    """LTP only (fallback)."""
+    if not instrument_key:
+        return None
     resp = requests.get(
         f"{BASE_URL}/market-quote/ltp",
         params={"instrument_key": instrument_key},
@@ -209,7 +282,5 @@ def get_option_ltp(instrument_key):
     )
     resp.raise_for_status()
     data = resp.json().get("data", {})
-    key  = list(data.keys())[0] if data else None
-    if key:
-        return data[key].get("last_price")
-    return None
+    key = list(data.keys())[0] if data else None
+    return data[key].get("last_price") if key else None

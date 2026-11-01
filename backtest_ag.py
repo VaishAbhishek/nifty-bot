@@ -26,6 +26,7 @@ import requests
 
 import config
 from signal_engine import SignalEngine, compute_indicators
+import costs
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_V2 = "https://api.upstox.com/v2"
@@ -140,7 +141,7 @@ def default_params():
         "risk_reward_ratio": config.RISK_REWARD_RATIO,
         "target_premium": config.TARGET_PREMIUM,
         "lot_size": config.LOT_SIZE,
-        "max_consecutive_losses": config.MAX_CONSECUTIVE_LOSSES,
+        "max_consecutive_losses": config.MAX_LOSSES_PER_DAY,
     }
 
 
@@ -235,7 +236,7 @@ def run_backtest(df_5min: pd.DataFrame, params: dict = None,
         # ── Force close at 3:15 PM ────────────────────────────────────
         if position is not None and current_time >= FORCE_CLOSE:
             exit_premium = position.entry_premium  # approximate: exit at entry (flat)
-            pnl_per_lot = 0.0
+            pnl_per_lot = -costs.round_trip_charges(exit_premium, exit_premium)
             result = "LOSS"
             trades.append(_make_trade_row(position, ts, exit_premium, "EOD", pnl_per_lot, result))
             if result == "LOSS":
@@ -284,7 +285,8 @@ def run_backtest(df_5min: pd.DataFrame, params: dict = None,
                 else:
                     exit_premium = position.entry_premium
 
-                pnl_per_lot = (exit_premium - position.entry_premium) * lot_size
+                pnl_per_lot = ((exit_premium - position.entry_premium) * lot_size
+                               - costs.round_trip_charges(position.entry_premium, exit_premium))
                 result = "WIN" if pnl_per_lot > 0 else "LOSS"
                 trades.append(_make_trade_row(position, ts, exit_premium, exit_reason, pnl_per_lot, result))
 
@@ -303,7 +305,7 @@ def run_backtest(df_5min: pd.DataFrame, params: dict = None,
             kind = event[0]
 
             if kind == "angle_check":
-                _, direction, angle_deg, passed = event
+                _, direction, angle_deg, passed = event[:4]
                 if verbose:
                     dir_str = "Bullish" if direction == 1 else "Bearish"
                     status = "PASSED ✅" if passed else "rejected"

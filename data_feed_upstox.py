@@ -16,7 +16,10 @@ import os
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
-IST         = ZoneInfo("Asia/Kolkata")
+import config
+import market_calendar
+
+IST        = ZoneInfo("Asia/Kolkata")
 BASE_V2     = "https://api.upstox.com/v2"
 BASE_V3     = "https://api.upstox.com/v3"
 ENCODED_KEY = "NSE_INDEX%7CNifty%2050"
@@ -31,20 +34,18 @@ def _headers():
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
+def _today_ist():
+    return pd.Timestamp.now(tz="Asia/Kolkata").date()
+
+
 def _last_trading_day():
-    """Most recent weekday (skips Saturday/Sunday)."""
-    d = date.today()
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+    """Most recent trading day before today (history excludes today's session)."""
+    return market_calendar.prev_trading_day(_today_ist())
 
 
 def _prev_trading_day(from_date):
-    """Trading day before from_date."""
-    d = from_date - timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+    """Trading day before from_date (skips weekends and NSE holidays)."""
+    return market_calendar.prev_trading_day(from_date)
 
 
 def _parse_candles(response_json):
@@ -125,17 +126,32 @@ def _get_today_candles():
         return pd.DataFrame(columns=["open", "high", "low", "close"])
 
 
+_hist_cache = {"day": None, "df": None}
+
+
+def _get_history_cached():
+    """
+    History (previous 10 trading days) doesn't change during the session, so
+    fetch it once per day instead of on every 30-second poll.
+    """
+    today = _today_ist()
+    if _hist_cache["day"] != today or _hist_cache["df"] is None:
+        _hist_cache["df"] = _get_history_candles()
+        _hist_cache["day"] = today
+    return _hist_cache["df"]
+
+
 def get_recent_candles():
     """
     Returns fully-closed 5-min Nifty candles for EMA seeding + today's live session.
 
-    Outside market hours: returns yesterday's candles only (no today data).
-    During market hours:  returns yesterday + today's candles merged.
+    Outside market hours: returns previous sessions' candles only.
+    During market hours:  returns history + today's candles merged.
     Partial in-progress candles are always dropped.
     """
-    # Historical candles for EMA seeding (10 trading days)
+    # Historical candles for EMA seeding (10 trading days, cached per day)
     try:
-        df_hist = _get_history_candles()
+        df_hist = _get_history_cached()
     except Exception as e:
         raise RuntimeError(f"Historical candle fetch failed: {e}")
 
@@ -189,5 +205,14 @@ def get_nifty_ltp():
     """
     try:
         return get_ltp(NIFTY_INSTRUMENT_KEY)
+    except Exception:
+        return None
+
+
+def get_vix():
+    """Current India VIX, or None if unavailable."""
+    try:
+        v = get_ltp(config.VIX_INSTRUMENT_KEY)
+        return float(v) if v else None
     except Exception:
         return None

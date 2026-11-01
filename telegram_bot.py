@@ -34,17 +34,35 @@ def send_message(text):
         print(f"[Telegram send failed: {e}] {text}")
 
 
-def request_approval(text, timeout_seconds=None):
+def _latest_update_id():
+    """
+    ID of the newest pending update, so old button taps (from earlier signals)
+    are never mistaken for an answer to the current one.
+    """
+    try:
+        resp = requests.get(_url("getUpdates"), params={"offset": -1, "timeout": 0}, timeout=10)
+        result = resp.json().get("result", [])
+        return result[-1]["update_id"] if result else None
+    except Exception:
+        return None
+
+
+def request_approval(text, timeout_seconds=None, on_tick=None):
     """
     Sends a message with Yes/No inline buttons, then polls for a response.
     Returns True if approved (button tap OR timeout elapses - per your
     "auto-execute if no response" choice), False only if explicitly rejected.
+
+    on_tick: optional callable run every poll cycle (e.g. monitor open
+    positions) so the bot never goes blind while waiting for you.
     """
     timeout_seconds = timeout_seconds or config.APPROVAL_TIMEOUT_SECONDS
 
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         print(f"[Telegram not configured - auto-approving] {text}")
         return True
+
+    last_update_id = _latest_update_id()
 
     keyboard = {
         "inline_keyboard": [[
@@ -66,9 +84,13 @@ def request_approval(text, timeout_seconds=None):
         return True
 
     deadline = time.time() + timeout_seconds
-    last_update_id = None
 
     while time.time() < deadline:
+        if on_tick:
+            try:
+                on_tick()
+            except Exception as e:
+                print(f"[Telegram on_tick error: {e}]")
         try:
             params = {"timeout": 5}
             if last_update_id is not None:
