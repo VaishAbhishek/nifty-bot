@@ -94,7 +94,7 @@ def main():
         # ── Same candle still running — check intrabar retest & monitor ──
         if latest_candle_utc == last_seen_candle_time:
             if not trader.is_flat():
-                _monitor_open_position(trader, now)
+                _monitor_all_positions(trader, now)
             elif engine.armed and config.USE_WICK_FOR_RETEST:
                 _check_intrabar_retest(engine, df, trader, now)
             elif trader.is_flat() and not engine.armed and engine.pending_dir == 0:
