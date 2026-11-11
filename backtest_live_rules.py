@@ -22,6 +22,11 @@ Outputs:
   live_rules_monthly.csv   month-by-month P&L of the live config and the best variant
   live_rules_trades.csv    every trade of the live config
 
+Entry signals come from the bot's own SignalEngine and config.py, replayed
+the way main.py runs it (candle-close entries plus live-price touches), so
+the trades should line up with paper_trades.csv. If paper_trades.csv is in
+the folder, a trade-by-trade reality check is printed at the end.
+
 Simplifications (read before trusting the numbers):
   * Option premium is modelled as entry premium + delta x index move,
     minus THETA_PTS_PER_HOUR of time decay. Real options also have gamma
@@ -33,6 +38,7 @@ Simplifications (read before trusting the numbers):
 """
 
 import itertools
+import os
 import sys
 
 import numpy as np
@@ -40,8 +46,8 @@ import pandas as pd
 
 import config
 import costs
-from backtest_filters import load_data, add_features, is_fc, MIN_ANGLE_DEG, \
-    ANGLE_CONFIRM_BARS, MAX_WAIT_BARS, TRAIN_FRACTION
+from backtest_filters import load_data, add_features, is_fc, TRAIN_FRACTION
+from signal_engine import SignalEngine, compute_indicators
 
 DELTA               = config.DEFAULT_DELTA
 ENTRY_PREMIUM       = config.TARGET_PREMIUM
@@ -64,103 +70,198 @@ FILTERS    = {
 LIVE = ("live 10-15", config.RISK_REWARD_RATIO, "trail on", "no filter")
 
 
-def run(df, band, rr, trail_steps, gate):
-    o, h, l, c = (df[k].values for k in ["open", "high", "low", "close"])
-    fast, slow, atr = df["fast"].values, df["slow"].values, df["atr"].values
-    adx, sess, idx = df["adx"].values, df["sess_side"].values, df.index
+def find_entries(df):
+    """
+    Drive the bot's own SignalEngine over history and list every entry signal
+    it would raise, the same two ways main.py does:
+      * candle_close: engine.process() fires 'entry' when a closed candle's wick
+        touched its Fast EMA (+ buffer). Entry at that candle's close.
+      * ltp_touch: while armed, the live price touching the last closed Fast EMA
+        (+ buffer) during the next candle. Entry at the touch price.
+    Signals do not depend on whether a position is open (main.py passes
+    flat=True), so they are computed once and reused for every variant.
+    """
+    ind = compute_indicators(df[["open", "high", "low", "close"]], config.FAST_EMA_LEN,
+                             config.SLOW_EMA_LEN, config.ATR_LEN)
+    engine = SignalEngine(config.MIN_ANGLE_DEG, config.ANGLE_CONFIRM_BARS,
+                          config.RETEST_BUFFER_PCT, config.USE_WICK_FOR_RETEST,
+                          config.MAX_WAIT_BARS)
+    o, h, l = ind["open"].values, ind["high"].values, ind["low"].values
+    fast, slow = ind["fast_ema"].values, ind["slow_ema"].values
+    idx, dates = ind.index, ind.index.date
+    n_sw = config.SWING_LOOKBACK_BARS
+    lo_n = ind["low"].rolling(n_sw).min().values
+    hi_n = ind["high"].rolling(n_sw).max().values
+    adx, sess = df["adx"].values, df["sess_side"].values
+    five = pd.Timedelta(minutes=5)
+
+    def stop_level(d, p, slow_val):
+        if d == 1:
+            return min(lo_n[p], slow_val) - config.SWING_BUFFER_POINTS
+        return max(hi_n[p], slow_val) + config.SWING_BUFFER_POINTS
+
+    def feat(d, p, when):
+        return {"adx": adx[p], "sess_aligned": int(sess[p] == d),
+                "entry_hour": when.hour + (0.5 if when.minute >= 30 else 0.0)}
+
+    out = []
+    for i in range(80, len(ind)):
+        ts = idx[i]
+        if dates[i] != dates[i - 1]:
+            engine.reset_day()
+
+        # live price touch during candle i, against the last CLOSED candle (i-1)
+        if engine.armed and engine.wait_start_ts is not None and dates[i] == dates[i - 1]:
+            wait_pos = idx.get_loc(engine.wait_start_ts)
+            if (i - 1 - wait_pos) >= 1 and not is_fc(ts):
+                d, p = engine.armed_dir, i - 1
+                level = fast[p] + d * fast[p] * config.RETEST_BUFFER_PCT / 100
+                touched = l[i] <= level if d == 1 else h[i] >= level
+                if touched:
+                    entry = min(level, o[i]) if d == 1 else max(level, o[i])
+                    out.append({"bar": i, "intrabar": True, "time": ts, "dir": d,
+                                "entry": entry, "und_stop": stop_level(d, p, slow[p]),
+                                "feat": feat(d, p, ts), "source": "ltp_touch"})
+                    engine.armed, engine.armed_dir, engine.wait_start_ts = False, 0, None
+
+        # candle i closes
+        window = ind.iloc[max(0, i - 300): i + 1]
+        close_time = ts + five
+        for ev in engine.process(window, flat=True):
+            if ev[0] == "entry" and not is_fc(close_time):
+                _, d, entry, slow_val = ev
+                out.append({"bar": i, "intrabar": False, "time": close_time, "dir": d,
+                            "entry": entry, "und_stop": stop_level(d, i, slow_val),
+                            "feat": feat(d, i, close_time), "source": "candle_close"})
+        if is_fc(close_time) and engine.armed:
+            engine.reset_day()
+    return out
+
+
+def run(df, entries, band, rr, trail_steps, gate):
+    o, h, l = (df[k].values for k in ["open", "high", "low"])
+    idx = df.index
     dates = idx.date
-    lo_n = df["low"].rolling(config.SWING_LOOKBACK_BARS).min().values
-    hi_n = df["high"].rolling(config.SWING_LOOKBACK_BARS).max().values
     sl_min, sl_max = band
     cost_unit = costs.cost_per_unit(ENTRY_PREMIUM)
+    by_bar = {}
+    for e in entries:
+        by_bar.setdefault(e["bar"], []).append(e)
 
     trades = []
-    pending, cross_i, armed, wait_i = 0, None, 0, None
     pos = None
     losses_today, pnl_today = 0, 0.0
 
     def close(ts, prem_move, reason):
         nonlocal pos, losses_today, pnl_today
-        hours = (ts - pos["time"]).total_seconds() / 3600
+        hours = max((ts - pos["time"]).total_seconds(), 0) / 3600
         exit_prem = max(ENTRY_PREMIUM + prem_move - THETA_PTS_PER_HOUR * hours - SLIPPAGE_PTS, 0.05)
         pnl = (exit_prem - ENTRY_PREMIUM) * LOT - costs.round_trip_charges(ENTRY_PREMIUM, exit_prem)
         trades.append({"entry_time": pos["time"], "exit_time": ts,
                        "direction": "CE" if pos["dir"] == 1 else "PE",
-                       "risk_pts": pos["R"], "exit_reason": reason,
-                       "pnl_rupees": round(pnl, 2),
+                       "source": pos["source"], "risk_pts": round(pos["R"], 2),
+                       "exit_reason": reason, "pnl_rupees": round(pnl, 2),
                        "r_multiple": round(pnl / (pos["R"] * LOT), 2)})
         pnl_today += pnl
         if pnl < -config.SCRATCH_RUPEES:
             losses_today += 1
         pos = None
 
+    def manage(i, ts):
+        """Stop / target / trail on candle i. Stop is checked first (worst case)."""
+        d, R = pos["dir"], pos["R"]
+        worst = ((l[i] if d == 1 else h[i]) - pos["entry"]) * d * DELTA
+        best = ((h[i] if d == 1 else l[i]) - pos["entry"]) * d * DELTA
+        if worst <= pos["stop"]:
+            close(ts, pos["stop"], "SL" if pos["stop"] < 0 else "Trail")
+        elif best >= rr * R:
+            close(ts, rr * R, "Target")
+        else:
+            for at_r, lock_r in trail_steps:
+                if best >= at_r * R:
+                    pos["stop"] = max(pos["stop"], lock_r * R + (cost_unit if lock_r == 0 else 0))
+
+    def try_open(e):
+        nonlocal pos
+        if pos is not None:
+            return
+        if losses_today >= config.MAX_LOSSES_PER_DAY or pnl_today <= -config.DAILY_MAX_LOSS_RUPEES:
+            return
+        if not gate(e["feat"]):
+            return
+        R = min(max(abs(e["entry"] - e["und_stop"]) * DELTA, sl_min), sl_max)
+        pos = {"dir": e["dir"], "entry": e["entry"], "R": R, "stop": -R,
+               "time": e["time"], "source": e["source"]}
+
     for i in range(80, len(df)):
         ts = idx[i]
-        new_day = dates[i] != dates[i - 1]
-        if new_day:
-            pending, cross_i, armed, wait_i = 0, None, 0, None
+        if dates[i] != dates[i - 1]:
             losses_today, pnl_today = 0, 0.0
-
         if pos is not None:
-            d, R = pos["dir"], pos["R"]
             if is_fc(ts):
-                close(ts, (o[i] - pos["entry"]) * d * DELTA, "EOD")
-                continue
-            # premium move at this bar's worst and best index price
-            worst = ((l[i] if d == 1 else h[i]) - pos["entry"]) * d * DELTA
-            best = ((h[i] if d == 1 else l[i]) - pos["entry"]) * d * DELTA
-            if worst <= pos["stop"]:
-                close(ts, pos["stop"], "SL" if pos["stop"] < 0 else "Trail")
-            elif best >= rr * R:
-                close(ts, rr * R, "Target")
+                close(ts, (o[i] - pos["entry"]) * pos["dir"] * DELTA, "EOD")
             else:
-                for at_r, lock_r in trail_steps:
-                    if best >= at_r * R:
-                        pos["stop"] = max(pos["stop"], lock_r * R + (cost_unit if lock_r == 0 else 0))
-            continue
-
-        blocked = (losses_today >= config.MAX_LOSSES_PER_DAY
-                   or pnl_today <= -config.DAILY_MAX_LOSS_RUPEES)
-
-        if armed and not new_day and not is_fc(ts) and i - 1 >= wait_i:
-            p = i - 1
-            limit = fast[p]
-            touched = l[i] <= limit if armed == 1 else h[i] >= limit
-            if touched:
-                entry = min(limit, o[i]) if armed == 1 else max(limit, o[i])
-                if armed == 1:
-                    und_stop = min(lo_n[p], slow[p]) - config.SWING_BUFFER_POINTS
-                else:
-                    und_stop = max(hi_n[p], slow[p]) + config.SWING_BUFFER_POINTS
-                R = min(max(abs(entry - und_stop) * DELTA, sl_min), sl_max)
-                feat = {"adx": adx[p], "sess_aligned": int(sess[p] == armed),
-                        "entry_hour": ts.hour + (0.5 if ts.minute >= 30 else 0.0)}
-                d_armed = armed
-                armed, wait_i = 0, None
-                if not blocked and gate(feat):
-                    pos = {"dir": d_armed, "entry": entry, "R": R, "stop": -R, "time": ts}
-                    worst = ((l[i] if d_armed == 1 else h[i]) - entry) * d_armed * DELTA
-                    if worst <= -R:
-                        close(ts, -R, "SL")
-                    continue
-
-        up = fast[i - 1] < slow[i - 1] and fast[i] > slow[i]
-        dn = fast[i - 1] > slow[i - 1] and fast[i] < slow[i]
-        gap = new_day and o[i] != c[i - 1]
-        if (up or dn) and not gap and not armed and pending == 0:
-            pending, cross_i = (1 if up else -1), i
-        if pending and i - cross_i == ANGLE_CONFIRM_BARS:
-            slope = (fast[i] - fast[cross_i]) / ANGLE_CONFIRM_BARS
-            ang = float(np.degrees(np.arctan(slope / atr[i]))) if atr[i] else 0.0
-            if (pending == 1 and ang >= MIN_ANGLE_DEG) or (pending == -1 and ang <= -MIN_ANGLE_DEG):
-                armed, wait_i = pending, i
-            pending, cross_i = 0, None
-        if armed:
-            broken = c[i] < slow[i] if armed == 1 else c[i] > slow[i]
-            if (i - wait_i) > MAX_WAIT_BARS or broken or is_fc(ts):
-                armed, wait_i = 0, None
+                manage(i, ts + pd.Timedelta(minutes=5))
+        for e in by_bar.get(i, []):
+            if e["intrabar"]:
+                try_open(e)
+                if pos is not None and pos["time"] == e["time"]:
+                    # rest of the entry candle: only the stop can be judged safely
+                    worst = ((l[i] if e["dir"] == 1 else h[i]) - e["entry"]) * e["dir"] * DELTA
+                    if worst <= -pos["R"]:
+                        close(ts + pd.Timedelta(minutes=5), -pos["R"], "SL")
+            else:
+                try_open(e)
 
     return pd.DataFrame(trades)
+
+
+def reconcile(bt, path=None):
+    """Line the backtest up against the bot's real paper trades, trade by trade."""
+    path = path or config.TRADE_LOG_PATH
+    if not os.path.exists(path) or bt.empty:
+        return
+    try:
+        p = pd.read_csv(path, on_bad_lines="skip")
+        p = p[pd.to_numeric(p["net_pnl"], errors="coerce").notna()].copy()
+        p["t"] = pd.to_datetime(p["date"].astype(str) + " " + p["entry_time"].astype(str)
+                                ).dt.tz_localize("Asia/Kolkata")
+        p["dir"] = p["option_type"]
+    except Exception as e:
+        print(f"\n(Could not read {path} for reconciliation: {e})")
+        return
+    if p.empty:
+        return
+    b = bt.copy()
+    b["t"] = pd.to_datetime(b["entry_time"])
+    last_data = b["t"].max().normalize() + pd.Timedelta(days=1)
+    b = b[b["t"] >= p["t"].min().normalize()]
+    used, rows = set(), []
+    for _, r in p.iterrows():
+        cand = b[(b["direction"] == r["dir"]) & ((b["t"] - r["t"]).abs() <= pd.Timedelta(minutes=20))
+                 & (~b.index.isin(used))]
+        if len(cand):
+            k = (cand["t"] - r["t"]).abs().idxmin()
+            used.add(k)
+            rows.append([f"{r['t']:%m-%d %H:%M}", r["dir"], r["exit_reason"], round(float(r["net_pnl"])),
+                         f"{b.loc[k, 't']:%H:%M}", b.loc[k, "exit_reason"], round(b.loc[k, "pnl_rupees"])])
+        else:
+            note = "after backtest data ends" if r["t"] >= last_data else "NOT IN BACKTEST"
+            rows.append([f"{r['t']:%m-%d %H:%M}", r["dir"], r["exit_reason"], round(float(r["net_pnl"])),
+                         "-", note, 0])
+    for k, r in b[~b.index.isin(used)].iterrows():
+        rows.append(["-", r["direction"], "BACKTEST ONLY", 0, f"{r['t']:%m-%d %H:%M}",
+                     r["exit_reason"], round(r["pnl_rupees"])])
+    rec = pd.DataFrame(rows, columns=["paper_entry", "type", "paper_exit", "paper_net",
+                                      "backtest_entry", "backtest_exit", "backtest_net"])
+    rec.to_csv("live_rules_reconcile.csv", index=False)
+    print("\n" + "=" * 110)
+    print("  REALITY CHECK — live config backtest vs your actual paper trades")
+    print("=" * 110)
+    print(rec.to_string(index=False))
+    both = rec[(rec.paper_entry != "-") & (rec.backtest_entry != "-")]
+    print(f"\n  Matched {len(both)} of {int((rec.paper_entry != '-').sum())} paper trades. "
+          f"On matched trades: paper ₹{both.paper_net.sum():,.0f} vs backtest ₹{both.backtest_net.sum():,.0f}.")
 
 
 def monthly(t):
@@ -201,10 +302,14 @@ def main():
     print(f"{len(days)} trading days (~{n_months:.1f} months). "
           f"Early period ends {cutoff}.\n")
 
+    entries = find_entries(df)
+    print(f"{len(entries)} entry signals from the bot's own SignalEngine "
+          f"({sum(e['source'] == 'ltp_touch' for e in entries)} live-price touches, "
+          f"{sum(e['source'] == 'candle_close' for e in entries)} candle closes).\n")
     rows, kept = [], {}
     for (bn, band), rr, (tn, steps), (fn, gate) in itertools.product(
             STOP_BANDS.items(), RR_VALUES, TRAILS.items(), FILTERS.items()):
-        t = run(df, band, rr, steps, gate)
+        t = run(df, entries, band, rr, steps, gate)
         s = stats(t, n_months, cutoff)
         if s is None:
             continue
@@ -246,7 +351,9 @@ def main():
     mt.to_csv("live_rules_monthly.csv")
     print("\n  MONTH BY MONTH (rupees per lot)")
     print(mt.to_string())
-    print("\nSaved: live_rules_results.csv, live_rules_monthly.csv, live_rules_trades.csv")
+    if LIVE in kept:
+        reconcile(kept[LIVE])
+    print("\nSaved: live_rules_results.csv, live_rules_monthly.csv, live_rules_trades.csv, live_rules_reconcile.csv")
 
 
 if __name__ == "__main__":
