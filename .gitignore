@@ -8,3 +8,4 @@ backtest_*.csv
 paper_trades_old_*.csv
 filter_*.csv
 nifty_5min_cache.csv
+live_rules_*.csv
