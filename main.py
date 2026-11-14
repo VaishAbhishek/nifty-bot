@@ -163,6 +163,8 @@ def main():
         for event in engine.process(df, flat=True):
             _handle_event(event, trader, now, df)
 
+        _alert_big_candle(df, now)
+
         if is_force_close_time(now) and engine.armed:
             journal.record_signal("invalidated", engine.armed_dir, now, "eod_force_close",
                                   _safe_context(df, now))
@@ -245,6 +247,33 @@ def _check_intrabar_crossover(df, now):
                 f"Live {float(live[4]):.2f} — wait for bar close + angle check.")
     except Exception as e:
         print(f"[{now:%H:%M:%S}] Intrabar crossover check error: {e}")
+
+
+def _alert_big_candle(df, now):
+    """Telegram alert (no trade) when the candle that just closed is big and mostly body."""
+    if not getattr(config, "BIG_CANDLE_ALERT", False):
+        return
+    try:
+        ts = df.index[-1]
+        if ts.time() == MARKET_OPEN:
+            return                                  # always ignore the 09:15 candle
+        if now - (ts + timedelta(minutes=5)) > timedelta(minutes=10):
+            return                                  # stale candle (e.g. just after a restart)
+        o, h, l, c = (float(df[k].iloc[-1]) for k in ("open", "high", "low", "close"))
+        rng, body = h - l, abs(c - o)
+        if rng < config.BIG_CANDLE_MIN_RANGE or body < config.BIG_CANDLE_MIN_BODY_PCT / 100 * rng:
+            return
+        colour = "RED 🔴" if c < o else "GREEN 🟢"
+        print(f"[{now:%H:%M:%S}] Big candle {ts:%H:%M}: range {rng:.1f}, body {body / rng * 100:.0f}%")
+        telegram_bot.send_message(
+            f"🕯 Big {colour} candle at {ts:%H:%M}\n"
+            f"Range {rng:.1f} pts (High {h:.2f} / Low {l:.2f})\n"
+            f"Body {body:.1f} pts = {body / rng * 100:.0f}% of range\n"
+            f"Wicks: upper {h - max(o, c):.1f}, lower {min(o, c) - l:.1f}\n"
+            f"Open {o:.2f} → Close {c:.2f}\n"
+            f"Alert only — no trade placed.")
+    except Exception as e:
+        print(f"[{now:%H:%M:%S}] Big-candle alert failed: {e}")
 
 
 def _check_ltp_retest(engine, df, trader, now):

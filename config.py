@@ -55,6 +55,13 @@ TRAIL_STEPS = [
     (1.5, 0.5),   # +1.5R reached -> lock in +0.5R
 ]
 
+# ===== BIG-CANDLE ALERT (Telegram notification only — never trades) =====
+# Fires when a closed 5-min candle is at least this many points high-to-low and
+# its body covers at least this % of that range. The 09:15 candle is always ignored.
+BIG_CANDLE_ALERT        = True
+BIG_CANDLE_MIN_RANGE    = 40.0   # Nifty points, high - low
+BIG_CANDLE_MIN_BODY_PCT = 75.0   # body as % of the candle's range
+
 # ===== POSITION & DAILY RISK RULES =====
 MAX_OPEN_POSITIONS   = 1      # One trade at a time
 MAX_LOSSES_PER_DAY   = 2      # Stop taking new trades after this many losing trades today
