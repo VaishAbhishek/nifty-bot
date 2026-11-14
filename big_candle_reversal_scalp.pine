@@ -56,15 +56,15 @@ flat    = strategy.position_size == 0
 signal  = sizeOk and wickOk and (isRed or isGreen) and timeOk and flat and barstate.isconfirmed
 
 // Reversal: red -> long, green -> short. Flip if "trade with the candle".
-dir = isRed ? 1 : -1
+tradeDir = isRed ? 1 : -1
 if not fadeCandle
-    dir := -dir
+    tradeDir := -tradeDir
 
 // ===== ENTRY + EXIT ORDERS =====
 if signal
     tgtDist = targetPct / 100 * rng
     slDist  = stopPct / 100 * rng
-    if dir == 1
+    if tradeDir == 1
         strategy.entry("CE", strategy.long)
         strategy.exit("CE exit", from_entry="CE", limit=close + tgtDist, stop=close - slDist)
     else
@@ -72,10 +72,10 @@ if signal
         strategy.exit("PE exit", from_entry="PE", limit=close - tgtDist, stop=close + slDist)
 
     if showLabels
-        txt = (dir == 1 ? "BUY CE\n" : "BUY PE\n") + str.tostring(rng, "#.#") + " pts\nT " + str.tostring(dir == 1 ? close + tgtDist : close - tgtDist, "#.#") + "\nSL " + str.tostring(dir == 1 ? close - slDist : close + slDist, "#.#")
-        label.new(bar_index, dir == 1 ? low : high, txt,
-             style=dir == 1 ? label.style_label_up : label.style_label_down,
-             color=dir == 1 ? color.new(color.green, 10) : color.new(color.red, 10),
+        txt = (tradeDir == 1 ? "BUY CE\n" : "BUY PE\n") + str.tostring(rng, "#.#") + " pts\nT " + str.tostring(tradeDir == 1 ? close + tgtDist : close - tgtDist, "#.#") + "\nSL " + str.tostring(tradeDir == 1 ? close - slDist : close + slDist, "#.#")
+        label.new(bar_index, tradeDir == 1 ? low : high, txt,
+             style=tradeDir == 1 ? label.style_label_up : label.style_label_down,
+             color=tradeDir == 1 ? color.new(color.green, 10) : color.new(color.red, 10),
              textcolor=color.white, size=size.small)
 
 // ===== END OF DAY =====
