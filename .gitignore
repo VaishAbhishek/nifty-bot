@@ -13,3 +13,4 @@ entries_*.csv
 candle_scalp_*.csv
 nifty_1min_cache.csv
 nifty_1min_older_cache.csv
+research_*.csv
