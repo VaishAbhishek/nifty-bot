@@ -24,6 +24,10 @@ Usage (on the VM, after market hours):
   set -a && source ~/.nifty_bot_env && set +a
   python3 backtest_candle_scalp.py
 
+Out-of-sample check on older data (frozen settings only, no tuning):
+  python3 backtest_candle_scalp.py --older        # 24 months before April 2026
+  python3 backtest_candle_scalp.py --older 36     # or as far back as you like
+
 Outputs:
   candle_scalp_trades.csv    every trade of YOUR rules
   candle_scalp_results.csv   your rules and every variant
@@ -36,11 +40,12 @@ Simplifications:
     No daily loss limit, so variants can be compared like for like.
 """
 
+import argparse
 import itertools
 import os
 import sys
 import time
-from datetime import timedelta
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -56,6 +61,8 @@ LOT            = config.LOT_SIZE
 SLIPPAGE_PTS   = 0.5          # assumed premium slippage per round trip (per unit)
 LOOKBACK_MONTHS = 7
 CACHE_1MIN     = "nifty_1min_cache.csv"
+CACHE_OLDER    = "nifty_1min_older_cache.csv"
+TUNED_FROM     = date(2026, 4, 9)   # first day of the data the variants were tuned on
 TRAIN_FRACTION = 0.67
 FIRST_ENTRY    = (9, 20)      # no entries before the first candle has closed
 LAST_ENTRY     = (15, 0)
@@ -64,6 +71,19 @@ FORCE_CLOSE    = (15, 15)
 # Your rules
 YOURS = {"min_range": 40, "body_pct": 0.75, "target": 0.50, "stop": 0.25,
          "wick_rule": True, "mode": "reversal"}
+
+# The only versions run on older data (--older). Chosen from the tuned period and
+# then frozen: the three that made money in both halves, the suggested middle
+# setting, and your original rules for reference.
+FROZEN = {
+    "your original rules":            YOURS,
+    "candidate (60pt, 75% body, T75, S50)":  {"min_range": 60, "body_pct": 0.75, "target": 0.75,
+                                              "stop": 0.50, "wick_rule": False, "mode": "reversal"},
+    "60pt, 85% body, T75, S50":       {"min_range": 60, "body_pct": 0.85, "target": 0.75,
+                                       "stop": 0.50, "wick_rule": False, "mode": "reversal"},
+    "60pt, 75% body, T100, S50":      {"min_range": 60, "body_pct": 0.75, "target": 1.00,
+                                       "stop": 0.50, "wick_rule": False, "mode": "reversal"},
+}
 
 # Variants (fixed in advance)
 GRID = {
@@ -77,37 +97,61 @@ GRID = {
 
 
 # ── data ────────────────────────────────────────────────────────────────────
-def load_1min():
-    if os.path.exists(CACHE_1MIN):
-        df = pd.read_csv(CACHE_1MIN, index_col=0)
-        df.index = pd.to_datetime(df.index, utc=True).tz_convert("Asia/Kolkata")
-        print(f"Loaded {len(df)} cached 1-min candles from {CACHE_1MIN} "
-              f"(delete the file to re-download)")
-        return df
-    print(f"Downloading {LOOKBACK_MONTHS} months of 1-min Nifty candles from Upstox...")
-    frames, end = [], _last_trading_day()
-    for n in range(LOOKBACK_MONTHS * 30 // 7 + 1):
+def _read_cache(path):
+    df = pd.read_csv(path, index_col=0)
+    df.index = pd.to_datetime(df.index, utc=True).tz_convert("Asia/Kolkata")
+    print(f"Loaded {len(df)} cached 1-min candles from {path} "
+          f"({df.index[0].date()} to {df.index[-1].date()}; delete the file to re-download)")
+    return df
+
+
+def download_1min(end, months, path):
+    """Download `months` of 1-min candles ending at `end`, newest first, and cache them."""
+    print(f"Downloading {months} months of 1-min Nifty candles ending {end} from Upstox...")
+    frames, empty_run, n_chunks = [], 0, months * 30 // 7 + 1
+    for n in range(n_chunks):
         start = end - timedelta(days=6)
         url = f"{BASE_V2}/historical-candle/{ENCODED_KEY}/1minute/{end:%Y-%m-%d}/{start:%Y-%m-%d}"
+        got = False
         try:
             r = requests.get(url, headers=_headers(), timeout=30)
             if r.status_code == 200:
                 chunk = _parse_candles_1min(r.json())
                 if not chunk.empty:
                     frames.append(chunk)
+                    got = True
             else:
                 print(f"  {start} to {end}: HTTP {r.status_code} {r.text[:80]}")
         except Exception as e:
             print(f"  {start} to {end}: {e}")
+        empty_run = 0 if got else empty_run + 1
+        if empty_run >= 6:
+            print(f"  No data for 6 weeks in a row before {end} - Upstox has nothing older. Stopping.")
+            break
+        if (n + 1) % 10 == 0:
+            print(f"  ...{n + 1}/{n_chunks} weeks")
         end = start - timedelta(days=1)
         time.sleep(0.3)
     if not frames:
-        raise RuntimeError("No data downloaded. Check the token.")
+        raise RuntimeError("No data downloaded. Check the token, or Upstox has no data that far back.")
     df = pd.concat(frames)
     df = df[~df.index.duplicated(keep="last")].sort_index().between_time("09:15", "15:29")
-    df.to_csv(CACHE_1MIN)
+    df.to_csv(path)
     print(f"Saved {len(df)} candles ({df.index[0].date()} to {df.index[-1].date()})")
     return df
+
+
+def load_1min():
+    if os.path.exists(CACHE_1MIN):
+        return _read_cache(CACHE_1MIN)
+    return download_1min(_last_trading_day(), LOOKBACK_MONTHS, CACHE_1MIN)
+
+
+def load_older(months):
+    """Data from BEFORE the period the settings were tuned on."""
+    if os.path.exists(CACHE_OLDER):
+        return _read_cache(CACHE_OLDER)
+    return download_1min(TUNED_FROM - timedelta(days=1), months, CACHE_OLDER)
 
 
 def to_5min(m1):
@@ -206,7 +250,55 @@ def stats(t, cutoff):
             "late_period": round(t[d > cutoff].pnl_rupees.sum(), 0)}
 
 
+def run_older(months):
+    """Out-of-sample check: frozen settings on data the tuning never saw."""
+    m1 = load_older(months)
+    m5 = to_5min(m1)
+    pos_of = {ts: i for i, ts in enumerate(m1.index)}
+    days = sorted(set(m1.index.date))
+    cutoff = days[len(days) // 2 - 1]
+    print(f"\nOLDER DATA: {days[0]} to {days[-1]} ({len(days)} trading days). "
+          f"None of this was used to choose the settings.\n")
+    rows, halves = [], {}
+    for name, p in FROZEN.items():
+        sig = find_signals(m5, p["min_range"], p["body_pct"], p["wick_rule"], p["mode"])
+        t = simulate(m1, pos_of, sig, p["target"], p["stop"])
+        s = stats(t, cutoff)
+        if s is None:
+            rows.append({"version": name, "trades": 0})
+            continue
+        s["first_half"], s["second_half"] = s.pop("early_period"), s.pop("late_period")
+        rows.append({"version": name, **s})
+        d = pd.to_datetime(t["entry_time"])
+        halves[name] = t.groupby(d.dt.year.astype(str) + "-H" + ((d.dt.month - 1) // 6 + 1).astype(str)
+                                 )["pnl_rupees"].sum().round(0)
+        if name.startswith("candidate"):
+            t.to_csv("candle_scalp_older_trades.csv", index=False)
+    res = pd.DataFrame(rows)
+    res.to_csv("candle_scalp_older_results.csv", index=False)
+    pd.set_option("display.width", 250); pd.set_option("display.max_columns", None)
+    print("=" * 120)
+    print("  FROZEN SETTINGS ON OLDER DATA (rupees per lot, net of costs)")
+    print("=" * 120)
+    print(res.to_string(index=False))
+    if halves:
+        hy = pd.DataFrame(halves).fillna(0)
+        hy.to_csv("candle_scalp_older_halfyears.csv")
+        print("\n  BY HALF-YEAR (rupees per lot)")
+        print(hy.to_string())
+    print("\nA version passes only if it is profitable overall AND in both halves here.")
+    print("Saved: candle_scalp_older_results.csv, candle_scalp_older_halfyears.csv, "
+          "candle_scalp_older_trades.csv (candidate version)")
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--older", nargs="?", const=24, type=int, metavar="MONTHS",
+                    help="test the frozen settings on data before the tuned period (default 24 months)")
+    args = ap.parse_args()
+    if args.older:
+        run_older(args.older)
+        return
     m1 = load_1min()
     m5 = to_5min(m1)
     pos_of = {ts: i for i, ts in enumerate(m1.index)}

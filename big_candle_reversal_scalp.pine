@@ -1,0 +1,88 @@
+//@version=5
+strategy("Big-Candle Reversal Scalp (Nifty 5m)", overlay=true,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     initial_capital=100000, pyramiding=0,
+     calc_on_every_tick=false, max_labels_count=500)
+
+// ============================================================
+// Use on the NIFTY 5-minute chart.
+//
+// Signal candle : range (high - low) >= Min candle size, and
+//                 body >= Min body % of that range.
+// Direction     : AGAINST the candle. Red candle -> long (buy CE).
+//                 Green candle -> short on this chart (buy PE).
+// Entry         : at the signal candle's close (next candle's open).
+// Target / Stop : a % of the signal candle's range, measured from
+//                 the signal candle's close.
+// All open trades are closed at 15:15 IST.
+//
+// The Strategy Tester shows NIFTY INDEX POINTS, not option P&L,
+// and no brokerage. Use it to check the signals and the win rate.
+//
+// Defaults are the "candidate" settings from the Python backtest.
+// Your original rules: Min candle size 40, Target 50, Stop 25,
+// Wick rule ON.
+// ============================================================
+
+// ===== INPUTS =====
+minRange   = input.float(60,  "Min candle size (high - low, points)", minval=1, step=5)
+bodyPct    = input.float(75,  "Min body % of candle range", minval=1, maxval=100, step=5)
+targetPct  = input.float(75,  "Target (% of signal candle range)", minval=1, step=5)
+stopPct    = input.float(50,  "Stop loss (% of signal candle range)", minval=1, step=5)
+useWick    = input.bool(false, "Wick rule: red needs longer LOWER wick, green needs longer UPPER wick")
+fadeCandle = input.bool(true,  "Trade AGAINST the candle (off = trade with it)")
+showLabels = input.bool(true,  "Show signal labels")
+
+// ===== CANDLE MEASUREMENTS =====
+rng     = high - low
+body    = math.abs(close - open)
+upperW  = high - math.max(open, close)
+lowerW  = math.min(open, close) - low
+isRed   = close < open
+isGreen = close > open
+
+sizeOk = rng >= minRange and body >= bodyPct / 100 * rng
+wickOk = not useWick or (isRed and lowerW > upperW) or (isGreen and upperW > lowerW)
+
+// ===== TIME RULES (IST) =====
+tz      = "Asia/Kolkata"
+barMin  = hour(time, tz) * 60 + minute(time, tz)   // minutes since midnight at candle OPEN
+// Signal candles from 09:15 to 14:55 -> entries from 09:20 to 15:00
+timeOk  = barMin >= 9 * 60 + 15 and barMin <= 14 * 60 + 55
+// The 15:10 candle's close is 15:15 -> flatten there
+eodBar  = barMin >= 15 * 60 + 10
+
+flat    = strategy.position_size == 0
+signal  = sizeOk and wickOk and (isRed or isGreen) and timeOk and flat and barstate.isconfirmed
+
+// Reversal: red -> long, green -> short. Flip if "trade with the candle".
+dir = isRed ? 1 : -1
+if not fadeCandle
+    dir := -dir
+
+// ===== ENTRY + EXIT ORDERS =====
+if signal
+    tgtDist = targetPct / 100 * rng
+    slDist  = stopPct / 100 * rng
+    if dir == 1
+        strategy.entry("CE", strategy.long)
+        strategy.exit("CE exit", from_entry="CE", limit=close + tgtDist, stop=close - slDist)
+    else
+        strategy.entry("PE", strategy.short)
+        strategy.exit("PE exit", from_entry="PE", limit=close - tgtDist, stop=close + slDist)
+
+    if showLabels
+        txt = (dir == 1 ? "BUY CE\n" : "BUY PE\n") + str.tostring(rng, "#.#") + " pts\nT " + str.tostring(dir == 1 ? close + tgtDist : close - tgtDist, "#.#") + "\nSL " + str.tostring(dir == 1 ? close - slDist : close + slDist, "#.#")
+        label.new(bar_index, dir == 1 ? low : high, txt,
+             style=dir == 1 ? label.style_label_up : label.style_label_down,
+             color=dir == 1 ? color.new(color.green, 10) : color.new(color.red, 10),
+             textcolor=color.white, size=size.small)
+
+// ===== END OF DAY =====
+if eodBar
+    strategy.cancel_all()
+    strategy.close_all("EOD")
+
+// ===== VISUALS =====
+barcolor(sizeOk and wickOk and timeOk ? color.yellow : na, title="Signal candle")
+bgcolor(eodBar ? color.new(color.gray, 90) : na, title="EOD close window")
